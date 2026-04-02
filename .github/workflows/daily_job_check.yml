@@ -7,7 +7,13 @@ on:
     - cron: "0 6 * * *"
 
   # Allow a manual run from the Actions tab at any time.
+  # Set test_email to true to verify email delivery without scraping.
   workflow_dispatch:
+    inputs:
+      test_email:
+        description: "Send a test email instead of scraping (yes/no)"
+        required: false
+        default: "no"
 
 jobs:
   check-jobs:
@@ -56,7 +62,13 @@ jobs:
 
           # ── Optional ──────────────────────────────────────────────────────
           LOG_LEVEL: INFO
-        run: python main.py
+        run: |
+          if [ "${{ github.event.inputs.test_email }}" = "yes" ]; then
+            echo "Running in TEST EMAIL mode..."
+            python main.py --test-email
+          else
+            python main.py
+          fi
 
       # ── 5. Commit updated seen_jobs.json ───────────────────────────────────
       - name: Persist seen job IDs

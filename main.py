@@ -1,5 +1,5 @@
 """
-main.py — Entry point for the Novo Nordisk job-monitoring tool.
+main.py — Entry point for the job-monitoring tool.
 
 Flow:
   1. Load previously seen job IDs from seen_jobs.json
@@ -9,11 +9,14 @@ Flow:
   5. Send email alert if any matches found (notifier.py)
   6. Persist the updated seen-job IDs back to seen_jobs.json
 
-Run manually:
+Run normally:
   python main.py
 
 Run with verbose logging:
   LOG_LEVEL=DEBUG python main.py
+
+Send a test email (verifies SMTP/SendGrid setup without scraping):
+  python main.py --test-email
 """
 
 import json
@@ -133,6 +136,50 @@ def _update_seen(seen_ids: set[str], jobs: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test-email mode
+# ---------------------------------------------------------------------------
+
+def run_test_email() -> int:
+    """Send a test email with dummy jobs to verify email delivery works."""
+    logger.info("=== TEST EMAIL MODE ===")
+    dummy_strong = [
+        {
+            "id": "test-001",
+            "title": "Operations Manager, Clinical Supplies",
+            "location": "Bagsværd, Denmark",
+            "date_posted": "2026-04-02",
+            "url": "https://careers.novonordisk.com",
+            "company": "Novo Nordisk",
+            "_competency_score": 9.5,
+            "_preference_score": 9.5,
+            "_combined": 9.5,
+        }
+    ]
+    dummy_possible = [
+        {
+            "id": "test-002",
+            "title": "Process Improvement Lead",
+            "location": "Copenhagen, Denmark",
+            "date_posted": "2026-04-02",
+            "url": "https://www.novonesis.com/en/careers/jobs",
+            "company": "Novonesis",
+            "_competency_score": 7.0,
+            "_preference_score": 6.0,
+            "_combined": 6.35,
+        }
+    ]
+    ok = notifier.send_alert(dummy_strong, dummy_possible)
+    if ok:
+        logger.info("Test email sent successfully — check your inbox.")
+        return 0
+    else:
+        logger.error("Test email FAILED — check your secret/env var settings.")
+        return 1
+
+
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    if "--test-email" in sys.argv:
+        sys.exit(run_test_email())
     sys.exit(run())
