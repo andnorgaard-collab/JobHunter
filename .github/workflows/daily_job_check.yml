@@ -1,0 +1,73 @@
+name: Daily Novo Nordisk Job Check
+
+on:
+  # Every day at 06:00 UTC = 07:00 CET (UTC+1) / 08:00 CEST (UTC+2 in summer).
+  # Adjust the hour if you want a different local time.
+  schedule:
+    - cron: "0 6 * * *"
+
+  # Allow a manual run from the Actions tab at any time.
+  workflow_dispatch:
+
+jobs:
+  check-jobs:
+    runs-on: ubuntu-latest
+
+    # Grant write access so we can commit seen_jobs.json back to the repo.
+    permissions:
+      contents: write
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Fetch the full history so that "git push" can fast-forward.
+          fetch-depth: 0
+
+      # ── 2. Python setup ────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── 3. Install dependencies ────────────────────────────────────────────
+      - name: Install dependencies
+        run: pip install --upgrade pip && pip install -r requirements.txt
+
+      # ── 4. Run the job monitor ─────────────────────────────────────────────
+      - name: Run job monitor
+        env:
+          # ── Required ──────────────────────────────────────────────────────
+          ALERT_FROM_EMAIL: ${{ secrets.ALERT_FROM_EMAIL }}
+          ALERT_TO_EMAIL:   ${{ secrets.ALERT_TO_EMAIL }}
+
+          # ── SendGrid (preferred) ──────────────────────────────────────────
+          # Set this secret to use SendGrid; leave blank to fall back to SMTP.
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+
+          # ── Gmail SMTP fallback ───────────────────────────────────────────
+          # Set these if you are NOT using SendGrid.
+          SMTP_HOST:     ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:     ${{ secrets.SMTP_PORT }}
+          SMTP_USER:     ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+
+          # ── Optional ──────────────────────────────────────────────────────
+          LOG_LEVEL: INFO
+        run: python main.py
+
+      # ── 5. Commit updated seen_jobs.json ───────────────────────────────────
+      - name: Persist seen job IDs
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add seen_jobs.json
+          # Only commit if seen_jobs.json actually changed.
+          if git diff --staged --quiet; then
+            echo "seen_jobs.json unchanged – nothing to commit."
+          else
+            git commit -m "chore: update seen jobs [skip ci]"
+            git push origin HEAD
+          fi

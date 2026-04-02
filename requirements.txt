@@ -1,0 +1,4 @@
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.1.0          # fast XML parser used by BeautifulSoup for the XML feed
+sendgrid>=6.11.0     # optional – only needed for SendGrid backend
