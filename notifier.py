@@ -124,12 +124,29 @@ def _html_section(heading: str, jobs: list[dict], accent_color: str) -> str:
 """
 
 
+def _score_bar(score: float, max_score: float = 10.0, bars: int = 10) -> str:
+    """Render a simple HTML progress bar for a score."""
+    filled = round((score / max_score) * bars)
+    filled = max(0, min(bars, filled))
+    pct = int((score / max_score) * 100)
+    color = "#2e7d32" if pct >= 70 else "#f57c00" if pct >= 40 else "#c62828"
+    return (
+        f'<span style="font-family:monospace; letter-spacing:1px; color:{color};">'
+        + "█" * filled + "░" * (bars - filled)
+        + f'</span> <span style="color:{color}; font-weight:600;">{score:.1f}/10</span>'
+    )
+
+
 def _html_card(job: dict) -> str:
-    title = _esc(job.get("title", "—"))
-    location = _esc(job.get("location", "—"))
+    title       = _esc(job.get("title", "—"))
+    location    = _esc(job.get("location", "—"))
     date_posted = _esc(job.get("date_posted", "—"))
-    company = _esc(job.get("company", ""))
-    url = job.get("url", "#")
+    company     = _esc(job.get("company", ""))
+    url         = job.get("url", "#")
+
+    comp_score = job.get("_competency_score", 0.0)
+    pref_score = job.get("_preference_score", 0.0)
+    combined   = job.get("_combined", 0.0)
 
     company_badge = ""
     if company == "Novonesis":
@@ -143,6 +160,14 @@ def _html_card(job: dict) -> str:
             'padding:2px 7px; border-radius:10px; margin-left:8px;">Novo Nordisk</span>'
         )
 
+    score_rows = ""
+    if comp_score or pref_score:
+        score_rows = f"""
+      <div style="margin-top:10px; font-size:12px; color:#555; line-height:1.8;">
+        <div>🎯 Career goal fit &nbsp; {_score_bar(pref_score)}</div>
+        <div>🛠 Background fit &nbsp;&nbsp; {_score_bar(comp_score)}</div>
+      </div>"""
+
     return f"""
     <div style="border:1px solid #e8e8e8; border-radius:6px; padding:14px 16px;
                 margin-bottom:10px;">
@@ -154,8 +179,8 @@ def _html_card(job: dict) -> str:
       </div>
       <div style="margin-top:6px; font-size:13px; color:#666;">
         📍 {location} &nbsp;|&nbsp; 📅 {date_posted}
-      </div>
-      <div style="margin-top:8px;">
+      </div>{score_rows}
+      <div style="margin-top:10px;">
         <a href="{url}" style="font-size:12px; background:#003e72; color:#fff;
                                 padding:4px 10px; border-radius:4px;
                                 text-decoration:none;">
@@ -188,13 +213,22 @@ def _render_text(strong: list[dict], possible: list[dict]) -> str:
 
 
 def _text_job(job: dict) -> list[str]:
-    return [
-        f"  {job.get('title', '—')}",
+    pref = job.get("_preference_score", 0.0)
+    comp = job.get("_competency_score", 0.0)
+    company = job.get("company", "")
+    score_line = (
+        f"  Scores:      Career goal fit {pref:.1f}/10  |  Background fit {comp:.1f}/10"
+        if (pref or comp) else ""
+    )
+    lines = [
+        f"  [{company}] {job.get('title', '—')}",
         f"  Location:    {job.get('location', '—')}",
         f"  Date posted: {job.get('date_posted', '—')}",
-        f"  Link:        {job.get('url', '—')}",
-        "",
     ]
+    if score_line:
+        lines.append(score_line)
+    lines += [f"  Link:        {job.get('url', '—')}", ""]
+    return lines
 
 
 def _esc(text: str) -> str:
