@@ -49,7 +49,7 @@ def send_alert(strong: list[dict], possible: list[dict]) -> bool:
     if not from_email or not to_email:
         return False
 
-    subject = f"🔔 [{total}] new Novo Nordisk job{'s' if total != 1 else ''} match your profile"
+    subject = f"🔔 [{total}] new job{'s' if total != 1 else ''} match your profile (NN + Novonesis)"
     html_body = _render_html(strong, possible)
     text_body = _render_text(strong, possible)
 
@@ -89,7 +89,7 @@ def _render_html(strong: list[dict], possible: list[dict]) -> str:
 
     <!-- Header -->
     <div style="background:#003e72; color:#fff; padding:28px 32px;">
-      <h1 style="margin:0; font-size:22px;">Novo Nordisk Job Alert</h1>
+      <h1 style="margin:0; font-size:22px;">Job Alert — Novo Nordisk &amp; Novonesis</h1>
       <p style="margin:6px 0 0; opacity:.8; font-size:14px;">{today}</p>
     </div>
 
@@ -102,8 +102,9 @@ def _render_html(strong: list[dict], possible: list[dict]) -> str:
       <p style="font-size:12px; color:#888; margin:0;">
         This alert was generated automatically.
         Jobs are sourced from
-        <a href="https://careers.novonordisk.com" style="color:#003e72;">
-          careers.novonordisk.com</a>.
+        <a href="https://careers.novonordisk.com" style="color:#003e72;">careers.novonordisk.com</a>
+        and
+        <a href="https://www.novonesis.com/en/careers/jobs" style="color:#1a6b1a;">novonesis.com</a>.
       </p>
     </div>
   </div>
@@ -127,15 +128,30 @@ def _html_card(job: dict) -> str:
     title = _esc(job.get("title", "—"))
     location = _esc(job.get("location", "—"))
     date_posted = _esc(job.get("date_posted", "—"))
+    company = _esc(job.get("company", ""))
     url = job.get("url", "#")
+
+    company_badge = ""
+    if company == "Novonesis":
+        company_badge = (
+            '<span style="background:#e8f4e8; color:#1a6b1a; font-size:11px; '
+            'padding:2px 7px; border-radius:10px; margin-left:8px;">Novonesis</span>'
+        )
+    elif company == "Novo Nordisk":
+        company_badge = (
+            '<span style="background:#e8f0fb; color:#003e72; font-size:11px; '
+            'padding:2px 7px; border-radius:10px; margin-left:8px;">Novo Nordisk</span>'
+        )
 
     return f"""
     <div style="border:1px solid #e8e8e8; border-radius:6px; padding:14px 16px;
                 margin-bottom:10px;">
-      <a href="{url}" style="font-size:15px; font-weight:600; color:#003e72;
-                              text-decoration:none;">
-        {title}
-      </a>
+      <div>
+        <a href="{url}" style="font-size:15px; font-weight:600; color:#003e72;
+                                text-decoration:none;">
+          {title}
+        </a>{company_badge}
+      </div>
       <div style="margin-top:6px; font-size:13px; color:#666;">
         📍 {location} &nbsp;|&nbsp; 📅 {date_posted}
       </div>

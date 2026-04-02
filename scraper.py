@@ -1,9 +1,11 @@
 """
-scraper.py — Fetches job listings from Novo Nordisk's career site.
+scraper.py — Fetches job listings from Novo Nordisk and Novonesis.
 
-Novo Nordisk uses SAP SuccessFactors (Career Site Builder) as their ATS.
-We attempt the SuccessFactors REST API first, then fall back to the
-public XML job feed, and finally to lightweight HTML parsing.
+Novo Nordisk  → SAP SuccessFactors (Career Site Builder)
+Novonesis     → Workday
+
+Every job dict returned includes a 'company' field so the email can
+group results by employer.
 """
 
 import logging
@@ -38,41 +40,52 @@ HEADERS = {
 
 def fetch_all_jobs() -> list[dict]:
     """
-    Return a list of normalised job dicts from Novo Nordisk's career site.
+    Return job dicts from both Novo Nordisk and Novonesis.
 
     Each dict contains at minimum:
-        id, title, location, date_posted, url
+        id, title, location, date_posted, url, company
     """
     session = requests.Session()
     session.headers.update(HEADERS)
 
     jobs: list[dict] = []
 
-    # Strategy 1 – SuccessFactors REST API (Career Site Builder v2)
-    jobs = _try_csb_api(session)
-    if jobs:
-        logger.info("Strategy 1 (CSB API): %d jobs", len(jobs))
-        return jobs
+    all_jobs: list[dict] = []
 
-    # Strategy 2 – SuccessFactors legacy XML job feed
-    jobs = _try_xml_feed(session)
-    if jobs:
-        logger.info("Strategy 2 (XML feed): %d jobs", len(jobs))
-        return jobs
+    # ── Novo Nordisk (SAP SuccessFactors) ────────────────────────────────
+    nn_jobs = _fetch_novo_nordisk(session)
+    logger.info("Novo Nordisk: %d jobs fetched", len(nn_jobs))
+    all_jobs.extend(nn_jobs)
 
-    # Strategy 3 – SuccessFactors OData v2 public endpoint
-    jobs = _try_odata(session)
-    if jobs:
-        logger.info("Strategy 3 (OData): %d jobs", len(jobs))
-        return jobs
+    time.sleep(REQUEST_DELAY)
 
-    # Strategy 4 – Lightweight HTML scrape (no JS rendering)
-    jobs = _try_html_scrape(session)
-    if jobs:
-        logger.info("Strategy 4 (HTML scrape): %d jobs", len(jobs))
-        return jobs
+    # ── Novonesis (Workday) ───────────────────────────────────────────────
+    nv_jobs = _fetch_novonesis(session)
+    logger.info("Novonesis: %d jobs fetched", len(nv_jobs))
+    all_jobs.extend(nv_jobs)
 
-    logger.warning("All scraping strategies returned 0 jobs.")
+    if not all_jobs:
+        logger.warning("Both scrapers returned 0 jobs.")
+
+    return all_jobs
+
+
+# --- Novo Nordisk dispatcher ---------------------------------------------
+
+def _fetch_novo_nordisk(session: requests.Session) -> list[dict]:
+    for fn, label in [
+        (_try_csb_api,     "CSB API"),
+        (_try_xml_feed,    "XML feed"),
+        (_try_odata,       "OData"),
+        (_try_html_scrape, "HTML scrape"),
+    ]:
+        jobs = fn(session)
+        if jobs:
+            logger.info("Novo Nordisk via %s: %d jobs", label, len(jobs))
+            for j in jobs:
+                j["company"] = "Novo Nordisk"
+            return jobs
+    logger.warning("Novo Nordisk: all strategies failed.")
     return []
 
 
@@ -452,3 +465,125 @@ def _try_html_scrape(session: requests.Session) -> list[dict]:
             logger.debug("HTML scrape error for %s: %s", url, exc)
 
     return []
+
+
+# =============================================================================
+# Novonesis – Workday scraper
+# =============================================================================
+
+# Workday tenant slugs to try (the merger may have kept the Novozymes tenant
+# for a while, so we probe both).
+_WD_TENANTS = [
+    ("novonesis",  "Novonesis_Careers"),
+    ("novonesis",  "Novonesis_External"),
+    ("novonesis",  "External"),
+    ("novozymes",  "Novozymes"),          # legacy, kept as fallback
+    ("novozymes",  "External"),
+]
+
+# Workday uses numbered data-centres: wd1 … wd5
+_WD_HOSTS = ["wd3", "wd1", "wd5"]
+
+
+def _fetch_novonesis(session: requests.Session) -> list[dict]:
+    """
+    Fetch jobs from Novonesis via Workday's public CXS (career-experience) API.
+
+    Workday exposes a POST endpoint at:
+      https://{tenant}.{host}.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs
+    which requires no authentication and returns JSON.
+    """
+    for host in _WD_HOSTS:
+        for tenant, site in _WD_TENANTS:
+            jobs = _wd_fetch_all_pages(session, host, tenant, site)
+            if jobs:
+                logger.info(
+                    "Novonesis via Workday (%s.%s.myworkdayjobs.com / %s): %d jobs",
+                    tenant, host, site, len(jobs),
+                )
+                for j in jobs:
+                    j["company"] = "Novonesis"
+                return jobs
+        time.sleep(REQUEST_DELAY)
+
+    logger.warning("Novonesis: all Workday tenants/sites returned 0 results.")
+    return []
+
+
+def _wd_fetch_all_pages(
+    session: requests.Session,
+    host: str,
+    tenant: str,
+    site: str,
+    page_size: int = 100,
+    max_pages: int = 20,
+) -> list[dict]:
+    base_url = (
+        f"https://{tenant}.{host}.myworkdayjobs.com"
+        f"/wday/cxs/{tenant}/{site}/jobs"
+    )
+    jobs: list[dict] = []
+    offset = 0
+
+    for _ in range(max_pages):
+        try:
+            resp = session.post(
+                base_url,
+                json={"appliedFacets": {}, "limit": page_size, "offset": offset, "searchText": ""},
+                headers={"Content-Type": "application/json"},
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+
+            postings = data.get("jobPostings") or []
+            if not postings:
+                break
+
+            for p in postings:
+                job = _wd_normalise(p, tenant, host, site)
+                if job:
+                    jobs.append(job)
+
+            total = data.get("total", 0)
+            offset += len(postings)
+            if offset >= total or len(postings) < page_size:
+                break
+
+            time.sleep(REQUEST_DELAY)
+
+        except Exception as exc:
+            logger.debug("Workday error (%s/%s offset=%d): %s", tenant, site, offset, exc)
+            break
+
+    return jobs
+
+
+def _wd_normalise(raw: dict, tenant: str, host: str, site: str) -> Optional[dict]:
+    """Normalise a Workday jobPosting dict."""
+    external_path = raw.get("externalPath", "")
+    # externalPath looks like /job/Bagsvaerd-Denmark/Operations-Manager_R-12345
+    # We use it as a stable ID.
+    job_id = external_path.strip("/").replace("/", "_") or raw.get("bulletFields", [""])[0]
+    if not job_id:
+        return None
+
+    title = raw.get("title") or "Unknown"
+    location = raw.get("locationsText") or raw.get("jobLocation") or ""
+
+    # Workday gives relative dates like "Posted 3 Days Ago"
+    date_posted = raw.get("postedOn") or ""
+
+    url = (
+        f"https://{tenant}.{host}.myworkdayjobs.com"
+        f"/en-US/{site}{external_path}"
+    )
+
+    return {
+        "id": f"wd_{job_id}",
+        "title": str(title),
+        "location": str(location),
+        "date_posted": str(date_posted),
+        "url": url,
+    }
