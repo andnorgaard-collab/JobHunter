@@ -23,6 +23,7 @@ import smtplib
 import ssl
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import formatdate, make_msgid
 from datetime import date
 
 logger = logging.getLogger(__name__)
@@ -306,10 +307,26 @@ def _send_smtp(
         )
         return False
 
+    # Pre-flight log — shows addresses without exposing the password
+    logger.info(
+        "SMTP config: host=%s port=%d user=%s | from=%s to=%s",
+        smtp_host, smtp_port, smtp_user, from_email, to_email,
+    )
+    if smtp_user.lower() != from_email.lower():
+        logger.warning(
+            "SMTP_USER (%s) != ALERT_FROM_EMAIL (%s). "
+            "Gmail will send as %s — update ALERT_FROM_EMAIL to match.",
+            smtp_user, from_email, smtp_user,
+        )
+        # Use smtp_user as the actual From so Gmail accepts it
+        from_email = smtp_user
+
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = from_email
     msg["To"] = to_email
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain="github-actions.local")
     msg.attach(MIMEText(text_body, "plain", "utf-8"))
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
@@ -320,7 +337,7 @@ def _send_smtp(
             server.starttls(context=context)
             server.login(smtp_user, smtp_password)
             server.sendmail(from_email, to_email, msg.as_bytes())
-        logger.info("Email sent via SMTP (%s:%d)", smtp_host, smtp_port)
+        logger.info("Email sent via SMTP to %s", to_email)
         return True
     except Exception as exc:
         logger.error("SMTP error: %s", exc)
