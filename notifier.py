@@ -50,7 +50,7 @@ def send_alert(strong: list[dict], possible: list[dict]) -> bool:
     if not from_email or not to_email:
         return False
 
-    subject = f"🔔 [{total}] new job{'s' if total != 1 else ''} match your profile (NN + Novonesis)"
+    subject = f"🔔 [{total}] new job{'s' if total != 1 else ''} match your profile"
     html_body = _render_html(strong, possible)
     text_body = _render_text(strong, possible)
 
@@ -90,7 +90,7 @@ def _render_html(strong: list[dict], possible: list[dict]) -> str:
 
     <!-- Header -->
     <div style="background:#003e72; color:#fff; padding:28px 32px;">
-      <h1 style="margin:0; font-size:22px;">Job Alert — Novo Nordisk &amp; Novonesis</h1>
+      <h1 style="margin:0; font-size:22px;">Job Alert — Novo Nordisk, Novonesis &amp; NNF</h1>
       <p style="margin:6px 0 0; opacity:.8; font-size:14px;">{today}</p>
     </div>
 
@@ -103,7 +103,8 @@ def _render_html(strong: list[dict], possible: list[dict]) -> str:
       <p style="font-size:12px; color:#888; margin:0;">
         This alert was generated automatically.
         Jobs are sourced from
-        <a href="https://careers.novonordisk.com" style="color:#003e72;">careers.novonordisk.com</a>
+        <a href="https://careers.novonordisk.com" style="color:#003e72;">careers.novonordisk.com</a>,
+        <a href="https://apply.workable.com/novonordiskfoundation/" style="color:#7a4b00;">novonordiskfonden.dk</a>
         and
         <a href="https://www.novonesis.com/en/careers/jobs" style="color:#1a6b1a;">novonesis.com</a>.
       </p>
@@ -149,16 +150,17 @@ def _html_card(job: dict) -> str:
     pref_score = job.get("_preference_score", 0.0)
     combined   = job.get("_combined", 0.0)
 
+    _BADGES = {
+        "Novo Nordisk": ("#e8f0fb", "#003e72"),
+        "Novonesis":    ("#e8f4e8", "#1a6b1a"),
+        "Novo Nordisk Fonden": ("#fdf3e3", "#7a4b00"),
+    }
     company_badge = ""
-    if company == "Novonesis":
+    if company in _BADGES:
+        bg, fg = _BADGES[company]
         company_badge = (
-            '<span style="background:#e8f4e8; color:#1a6b1a; font-size:11px; '
-            'padding:2px 7px; border-radius:10px; margin-left:8px;">Novonesis</span>'
-        )
-    elif company == "Novo Nordisk":
-        company_badge = (
-            '<span style="background:#e8f0fb; color:#003e72; font-size:11px; '
-            'padding:2px 7px; border-radius:10px; margin-left:8px;">Novo Nordisk</span>'
+            f'<span style="background:{bg}; color:{fg}; font-size:11px; '
+            f'padding:2px 7px; border-radius:10px; margin-left:8px;">{company}</span>'
         )
 
     score_rows = ""

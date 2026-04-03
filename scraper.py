@@ -40,7 +40,7 @@ HEADERS = {
 
 def fetch_all_jobs() -> list[dict]:
     """
-    Return job dicts from both Novo Nordisk and Novonesis.
+    Return job dicts from Novo Nordisk, Novonesis, and Novo Nordisk Fonden.
 
     Each dict contains at minimum:
         id, title, location, date_posted, url, company
@@ -48,24 +48,29 @@ def fetch_all_jobs() -> list[dict]:
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    jobs: list[dict] = []
-
     all_jobs: list[dict] = []
 
-    # ── Novo Nordisk (SAP SuccessFactors) ────────────────────────────────
+    # ── Novo Nordisk (SAP SuccessFactors / sitemap) ───────────────────────
     nn_jobs = _fetch_novo_nordisk(session)
     logger.info("Novo Nordisk: %d jobs fetched", len(nn_jobs))
     all_jobs.extend(nn_jobs)
 
     time.sleep(REQUEST_DELAY)
 
-    # ── Novonesis (Workday) ───────────────────────────────────────────────
+    # ── Novonesis (own careers portal) ───────────────────────────────────
     nv_jobs = _fetch_novonesis(session)
     logger.info("Novonesis: %d jobs fetched", len(nv_jobs))
     all_jobs.extend(nv_jobs)
 
+    time.sleep(REQUEST_DELAY)
+
+    # ── Novo Nordisk Fonden (Workable API) ───────────────────────────────
+    nnf_jobs = _fetch_nnfonden(session)
+    logger.info("Novo Nordisk Fonden: %d jobs fetched", len(nnf_jobs))
+    all_jobs.extend(nnf_jobs)
+
     if not all_jobs:
-        logger.warning("Both scrapers returned 0 jobs.")
+        logger.warning("All scrapers returned 0 jobs.")
 
     return all_jobs
 
@@ -998,3 +1003,69 @@ def _wd_normalise(raw: dict, tenant: str, host: str, site: str) -> Optional[dict
         "date_posted": str(date_posted),
         "url": url,
     }
+
+
+# =============================================================================
+# Novo Nordisk Fonden – Workable API
+# =============================================================================
+
+_NNF_WORKABLE_SLUG = "novonordiskfoundation"
+
+
+def _fetch_nnfonden(session: requests.Session) -> list[dict]:
+    """
+    Fetch jobs from Novo Nordisk Fonden via the public Workable widget API.
+    No authentication required.
+    """
+    url = f"https://apply.workable.com/api/v1/widget/accounts/{_NNF_WORKABLE_SLUG}"
+    try:
+        resp = session.get(url, timeout=20,
+                           headers={**HEADERS, "Accept": "application/json"})
+        logger.debug("NNF Workable API → HTTP %d", resp.status_code)
+        if resp.status_code != 200:
+            logger.warning("NNF Workable API → HTTP %d", resp.status_code)
+            return []
+
+        data = resp.json()
+        postings = data.get("jobs") or []
+        if not postings:
+            logger.info("NNF Workable API returned 0 postings")
+            return []
+
+        jobs: list[dict] = []
+        for p in postings:
+            job_id = p.get("id") or p.get("shortcode") or ""
+            title = p.get("title") or "Unknown"
+            loc = p.get("location") or {}
+            if isinstance(loc, dict):
+                city = loc.get("city") or loc.get("location") or ""
+                country = loc.get("country") or ""
+                location = f"{city}, {country}".strip(", ") if country else city
+            else:
+                location = str(loc)
+
+            date_posted = p.get("created_at") or p.get("published_on") or ""
+            # Trim ISO timestamp to date only
+            if date_posted and "T" in date_posted:
+                date_posted = date_posted.split("T")[0]
+
+            job_url = (
+                p.get("url")
+                or p.get("application_url")
+                or f"https://apply.workable.com/{_NNF_WORKABLE_SLUG}/j/{job_id}/"
+            )
+
+            jobs.append({
+                "id": f"nnf_{job_id}",
+                "title": str(title),
+                "location": location,
+                "date_posted": date_posted,
+                "url": job_url,
+                "company": "Novo Nordisk Fonden",
+            })
+
+        return jobs
+
+    except Exception as exc:
+        logger.warning("NNF Workable API error: %s", exc)
+        return []
