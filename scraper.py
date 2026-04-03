@@ -720,145 +720,199 @@ def _try_html_scrape(session: requests.Session) -> list[dict]:
 
 
 # =============================================================================
-# Novonesis – Workday scraper
+# Novonesis scraper
 # =============================================================================
-
-# Workday tenant + site combinations to try.
-# The merger kept some Novozymes infrastructure; we probe common patterns.
-_WD_TENANTS_PRIMARY = ["novonesis", "novozymes"]
-
-# Fallback site names if auto-discovery fails
-_WD_SITE_GUESSES = [
-    "Novonesis", "NovonesisCareers", "Novonesis_Careers",
-    "Novonesis_External", "Novonesis_ExternalCareerSite",
-    "External", "novonesis",
-    "Novozymes", "Novozymes_External", "novozymes",
-]
-
-# Workday uses numbered data-centres: wd1 … wd5
-_WD_HOSTS = ["wd3", "wd1", "wd5"]
+# Novonesis hosts jobs on their own website (novonesis.com), NOT on a
+# Workday external career portal.  We try:
+#   1. SmartRecruiters public API  (common ATS for life-science companies)
+#   2. Greenhouse public API
+#   3. Lever public API
+#   4. Novonesis website with retry on 429
 
 
-def _wd_discover_from_page(session: requests.Session) -> Optional[tuple]:
-    """
-    Fetch the Novonesis main careers page and extract the embedded Workday URL.
-    Returns (tenant, host, site) or None.
-    """
-    import re
-    careers_urls = [
-        "https://www.novonesis.com/en/careers/jobs",
-        "https://www.novonesis.com/en/careers",
-        "https://www.novonesis.com/careers",
-    ]
-    for url in careers_urls:
-        try:
-            resp = session.get(
-                url, timeout=20,
-                headers={**HEADERS, "Accept": "text/html,application/xhtml+xml,*/*"},
-            )
-            if resp.status_code != 200:
-                continue
-            # Look for myworkdayjobs.com URLs in the HTML
-            pattern = r"https?://([a-zA-Z0-9-]+)\.(wd\d+)\.myworkdayjobs\.com(?:/[^\"']*)?/en-[A-Z]{2}/([^/\"'?#]+)"
-            m = re.search(pattern, resp.text)
-            if m:
-                tenant, host, site = m.group(1), m.group(2), m.group(3)
-                logger.info("Discovered Workday URL from %s: %s.%s / %s", url, tenant, host, site)
-                return tenant, host, site
-            # Tenant/host without site
-            m2 = re.search(r"([a-zA-Z0-9-]+)\.(wd\d+)\.myworkdayjobs\.com", resp.text)
-            if m2:
-                logger.info("Discovered Workday tenant from %s: %s.%s", url, m2.group(1), m2.group(2))
-                return m2.group(1), m2.group(2), None
-        except Exception as exc:
-            logger.debug("Novonesis page discovery error %s: %s", url, exc)
-    return None
-
-
-def _wd_discover_site(session: requests.Session, host: str, tenant: str) -> Optional[str]:
-    """
-    GET the Workday tenant root with browser-like headers and extract
-    the career-site name from the redirect URL.
-    Workday redirects / → /en-US/{SiteName}/ which reveals the correct site name.
-    """
-    import re
-    url = f"https://{tenant}.{host}.myworkdayjobs.com/"
-    try:
-        resp = session.get(
-            url, timeout=15, allow_redirects=True,
-            headers={**HEADERS, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
-        )
-        final = resp.url
-        match = re.search(r"/en-[A-Z]{2}/([^/?#]+)", final)
-        if match:
-            site = match.group(1)
-            logger.info("Workday auto-discovered site: %s.%s → %s", tenant, host, site)
-            return site
-        # Also scan the response body for the site name
-        body_match = re.search(
-            rf"/{tenant}/([^/\"'?#]+)/jobs", resp.text, re.IGNORECASE
-        )
-        if body_match:
-            site = body_match.group(1)
-            logger.info("Workday site from body: %s.%s → %s", tenant, host, site)
-            return site
-    except Exception as exc:
-        logger.debug("Workday site discovery failed (%s.%s): %s", tenant, host, exc)
-    return None
+_NV_BASE = "https://www.novonesis.com"
+_NV_SLUG = "novonesis"   # used as company slug for ATS API guesses
 
 
 def _fetch_novonesis(session: requests.Session) -> list[dict]:
-    """
-    Fetch jobs from Novonesis via Workday's public CXS API.
-    1. Try to discover tenant/site from the Novonesis careers page HTML.
-    2. Fall back to probing known tenants + auto-discovery from Workday root.
-    3. Fall back to guessing site names.
-    """
-    # Step 1: parse the Novonesis website for an embedded Workday URL
-    found = _wd_discover_from_page(session)
-    if found:
-        tenant, host, site = found
-        if site:
-            jobs = _wd_fetch_all_pages(session, host, tenant, site)
-            if jobs:
-                logger.info("Novonesis via page-discovered site (%s.%s/%s): %d jobs", tenant, host, site, len(jobs))
-                for j in jobs:
-                    j["company"] = "Novonesis"
-                return jobs
-        # We found tenant+host but not site — add to guesses below
-        hosts_to_try = [host] + [h for h in _WD_HOSTS if h != host]
-        tenants_to_try = [tenant] + [t for t in _WD_TENANTS_PRIMARY if t != tenant]
-    else:
-        hosts_to_try = _WD_HOSTS
-        tenants_to_try = _WD_TENANTS_PRIMARY
+    for fn, label in [
+        (_nv_smartrecruiters, "SmartRecruiters API"),
+        (_nv_greenhouse,      "Greenhouse API"),
+        (_nv_lever,           "Lever API"),
+        (_nv_website,         "Novonesis website"),
+    ]:
+        jobs = fn(session)
+        if jobs:
+            logger.info("Novonesis via %s: %d jobs", label, len(jobs))
+            for j in jobs:
+                j["company"] = "Novonesis"
+            return jobs
 
-    # Step 2+3: probe known combinations with root auto-discovery + guesses
-    for host in hosts_to_try:
-        for tenant in tenants_to_try:
-            discovered = _wd_discover_site(session, host, tenant)
-            sites_to_try = (
-                [discovered] + _WD_SITE_GUESSES if discovered
-                else _WD_SITE_GUESSES
-            )
-
-            for site in sites_to_try:
-                if not site:
-                    continue
-                jobs = _wd_fetch_all_pages(session, host, tenant, site)
-                if jobs:
-                    logger.info(
-                        "Novonesis via Workday (%s.%s / %s): %d jobs",
-                        tenant, host, site, len(jobs),
-                    )
-                    for j in jobs:
-                        j["company"] = "Novonesis"
-                    return jobs
-        time.sleep(REQUEST_DELAY)
-
-    logger.warning("Novonesis: all Workday tenants/sites returned 0 results.")
+    logger.warning("Novonesis: all strategies returned 0 results.")
     return []
 
 
+def _nv_smartrecruiters(session: requests.Session) -> list[dict]:
+    """SmartRecruiters public job postings API."""
+    slugs = [_NV_SLUG, "novonesis-as", "novonesis-group"]
+    for slug in slugs:
+        try:
+            url = f"https://api.smartrecruiters.com/v1/companies/{slug}/postings"
+            resp = session.get(url, params={"limit": 100, "status": "PUBLIC"}, timeout=20)
+            logger.debug("SmartRecruiters %s → HTTP %d", slug, resp.status_code)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            postings = data.get("content") or data.get("postings") or []
+            if not postings:
+                continue
+            jobs = []
+            for p in postings:
+                job_id = p.get("id") or p.get("refNumber", "")
+                title = p.get("name") or p.get("title") or "Unknown"
+                loc = p.get("location", {})
+                location = f"{loc.get('city','')} {loc.get('country','')}".strip()
+                jobs.append({
+                    "id": f"sr_{job_id}",
+                    "title": str(title),
+                    "location": location,
+                    "date_posted": p.get("releasedDate") or p.get("createdOn") or "",
+                    "url": p.get("ref") or f"https://jobs.smartrecruiters.com/{slug}/{job_id}",
+                })
+            return jobs
+        except Exception as exc:
+            logger.debug("SmartRecruiters error (%s): %s", slug, exc)
+    return []
+
+
+def _nv_greenhouse(session: requests.Session) -> list[dict]:
+    """Greenhouse public job board API."""
+    slugs = [_NV_SLUG, "novonesis", "novozymes"]
+    for slug in slugs:
+        try:
+            url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
+            resp = session.get(url, params={"content": "true"}, timeout=20)
+            logger.debug("Greenhouse %s → HTTP %d", slug, resp.status_code)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            postings = data.get("jobs") or []
+            if not postings:
+                continue
+            jobs = []
+            for p in postings:
+                job_id = p.get("id", "")
+                location = (p.get("location") or {}).get("name") or ""
+                jobs.append({
+                    "id": f"gh_{job_id}",
+                    "title": p.get("title") or "Unknown",
+                    "location": location,
+                    "date_posted": p.get("updated_at") or "",
+                    "url": p.get("absolute_url") or "",
+                })
+            return jobs
+        except Exception as exc:
+            logger.debug("Greenhouse error (%s): %s", slug, exc)
+    return []
+
+
+def _nv_lever(session: requests.Session) -> list[dict]:
+    """Lever public job postings API."""
+    slugs = [_NV_SLUG, "novonesis", "novozymes"]
+    for slug in slugs:
+        try:
+            url = f"https://api.lever.co/v0/postings/{slug}"
+            resp = session.get(url, params={"mode": "json", "limit": 250}, timeout=20)
+            logger.debug("Lever %s → HTTP %d", slug, resp.status_code)
+            if resp.status_code != 200:
+                continue
+            postings = resp.json()
+            if not isinstance(postings, list) or not postings:
+                continue
+            jobs = []
+            for p in postings:
+                job_id = p.get("id", "")
+                loc_list = p.get("categories", {}).get("location") or p.get("workplaceType") or ""
+                jobs.append({
+                    "id": f"lv_{job_id}",
+                    "title": p.get("text") or "Unknown",
+                    "location": str(loc_list),
+                    "date_posted": "",
+                    "url": p.get("hostedUrl") or p.get("applyUrl") or "",
+                })
+            return jobs
+        except Exception as exc:
+            logger.debug("Lever error (%s): %s", slug, exc)
+    return []
+
+
+def _nv_website(session: requests.Session) -> list[dict]:
+    """
+    Scrape the Novonesis careers page directly.
+    Retries up to 3 times on 429 with backoff.
+    Looks for __NEXT_DATA__ or embedded JSON.
+    """
+    import json
+    import re
+
+    urls = [
+        f"{_NV_BASE}/en/careers/jobs",
+        f"{_NV_BASE}/en/careers",
+    ]
+    browser_headers = {**HEADERS, "Accept": "text/html,application/xhtml+xml,*/*"}
+
+    for url in urls:
+        for attempt in range(3):
+            try:
+                resp = session.get(url, timeout=25, headers=browser_headers)
+                if resp.status_code == 429:
+                    wait = 5 * (attempt + 1)
+                    logger.debug("Novonesis website 429, retry in %ds", wait)
+                    time.sleep(wait)
+                    continue
+                if resp.status_code != 200:
+                    break
+
+                soup = BeautifulSoup(resp.text, "html.parser")
+
+                # Next.js SSR data
+                nd_tag = soup.find("script", id="__NEXT_DATA__")
+                if nd_tag:
+                    try:
+                        nd = json.loads(nd_tag.string or "")
+                        found = _extract_jobs_from_nextdata(nd)
+                        if found:
+                            logger.info("Novonesis __NEXT_DATA__ jobs: %d", len(found))
+                            return found
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+
+                # Inline JSON patterns
+                for script in soup.find_all("script"):
+                    text = script.string or ""
+                    for pat in [
+                        r"window\.__INITIAL_STATE__\s*=\s*(\{.+?\});",
+                        r'"jobs"\s*:\s*(\[.+?\])',
+                        r'"postings"\s*:\s*(\[.+?\])',
+                    ]:
+                        m = re.search(pat, text, re.DOTALL)
+                        if m:
+                            try:
+                                data = json.loads(m.group(1))
+                                parsed = _parse_json_response(data) if isinstance(data, (dict, list)) else []
+                                if parsed:
+                                    return parsed
+                            except json.JSONDecodeError:
+                                pass
+                break  # got a 200, no jobs found → try next URL
+            except Exception as exc:
+                logger.debug("Novonesis website error (%s attempt %d): %s", url, attempt, exc)
+                break
+
+    return []
+
+
+# Kept for potential future use (Workday-based ATS)
 def _wd_fetch_all_pages(
     session: requests.Session,
     host: str,
