@@ -290,7 +290,33 @@ def classify_jobs(jobs: list[dict]) -> dict[str, list[dict]]:
     possible.sort(key=lambda j: j["_combined"], reverse=True)
 
     logger.info("Classified: %d strong, %d possible", len(strong), len(possible))
+    if not strong and not possible:
+        _debug_score_sample(jobs)
     return {"strong": strong, "possible": possible}
+
+
+def _debug_score_sample(jobs: list[dict], n: int = 10) -> None:
+    """Log the top-n scorers regardless of threshold (call manually for diagnostics)."""
+    scored = []
+    excluded = 0
+    for job in jobs:
+        title = job.get("title", "").lower()
+        location = job.get("location", "").lower()
+        haystack = f"{title} {location}"
+        excl = next((p for p in EXCLUSION_PATTERNS if re.search(p, haystack, re.IGNORECASE)), None)
+        if excl:
+            excluded += 1
+            continue
+        s = _score_job(job)
+        if s:
+            scored.append(s)
+        else:
+            scored.append(ScoredJob(job=job, competency_score=0.0, preference_score=0.0))
+    scored.sort(key=lambda s: s.combined, reverse=True)
+    logger.info("Debug sample — excluded=%d, top scorers:", excluded)
+    for s in scored[:n]:
+        logger.info("  combined=%.2f  title=%r  loc=%r",
+                    s.combined, s.job.get("title"), s.job.get("location"))
 
 
 # ---------------------------------------------------------------------------

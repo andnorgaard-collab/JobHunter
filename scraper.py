@@ -194,6 +194,10 @@ def _parse_sitemap_jobs(soup) -> list[dict]:
         })
 
     logger.info("Sitemap: parsed %d job URLs", len(jobs))
+    if jobs:
+        for j in jobs[:8]:
+            logger.info("  sample → title=%r  location=%r  url=...%s",
+                        j["title"], j["location"], j["url"][-60:])
     return jobs
 
 
