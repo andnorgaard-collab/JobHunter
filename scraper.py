@@ -144,10 +144,17 @@ def _try_nn_sitemap(session: requests.Session) -> list[dict]:
 def _parse_sitemap_jobs(soup) -> list[dict]:
     """
     Extract job dicts from a parsed sitemap.
-    Expects URLs like /job/{City}-{Country}/{Title}_{JobId}
-    or              /job/{City}-{Country}-{Title}_{JobId}
+
+    Novo Nordisk CSB uses the URL format:
+        /job/{City}-{Title words}-{StateAbbrev}/{NumericJobId}/
+    e.g. /job/Bagsvaerd-Denmark-Operations-Manager-Bags/1234567/
+
+    The first dash-segment contains: City (first word) + Title (middle) +
+    StateAbbrev (last word, 3-4 chars truncated from state/city).
+    The second segment is the pure numeric job ID.
     """
     import re
+    from urllib.parse import unquote
 
     jobs: list[dict] = []
     for url_tag in soup.find_all("url"):
@@ -158,29 +165,47 @@ def _parse_sitemap_jobs(soup) -> list[dict]:
         if "/job/" not in url.lower():
             continue
 
-        # Extract the path segment after /job/
         m = re.search(r"/job/([^?#]+)", url, re.IGNORECASE)
         if not m:
             continue
-        slug = m.group(1).rstrip("/")
+        slug = unquote(m.group(1)).rstrip("/")
 
-        # Split on underscore to separate title-slug from job-id
-        # e.g. "Bagsvaerd-Denmark/Senior-Operations-Manager_R-12345"
-        #   or "Bagsvaerd-Denmark-Senior-Operations-Manager_R-12345"
-        parts = slug.rsplit("_", 1)
-        job_id = parts[-1] if len(parts) > 1 else re.sub(r"[^A-Za-z0-9-]", "", slug)
+        title = ""
+        location = ""
+        job_id = ""
 
-        slug_body = parts[0] if len(parts) > 1 else slug
-
-        # If there's a "/" separator, first segment is location, rest is title
-        if "/" in slug_body:
-            loc_part, title_part = slug_body.split("/", 1)
-            location = loc_part.replace("-", " ").title()
-            title = title_part.replace("-", " ").title()
+        # Format A: /job/{city-title-stateabbrev}/{numericId}/   (current NN format)
+        slash_parts = slug.split("/")
+        if len(slash_parts) == 2 and slash_parts[1].isdigit():
+            job_id = slash_parts[1]
+            words = slash_parts[0].split("-")
+            if len(words) >= 3:
+                # First word = city, last word = 3-4 char state/region abbrev, middle = title
+                location = words[0].title()
+                title = " ".join(words[1:-1]).title()
+            elif len(words) == 2:
+                location = words[0].title()
+                title = words[1].title()
+            else:
+                title = slash_parts[0].replace("-", " ").title()
+        # Format B: /job/{location}/{title}_{jobId}/  (older SF CSB format)
+        elif "_" in slug:
+            parts = slug.rsplit("_", 1)
+            job_id = parts[-1]
+            slug_body = parts[0]
+            if "/" in slug_body:
+                loc_part, title_part = slug_body.split("/", 1)
+                location = loc_part.replace("-", " ").title()
+                title = title_part.replace("-", " ").title()
+            else:
+                title = slug_body.replace("-", " ").title()
         else:
-            # All dashes — try to split on a known country/city name
-            location = ""
-            title = slug_body.replace("-", " ").title()
+            job_id = re.sub(r"[^A-Za-z0-9-]", "", slug)
+            title = slug.replace("-", " ").title()
+
+        # Skip entries that have no alphabetic title (just numbers)
+        if not title or not re.search(r"[a-zA-Z]", title):
+            continue
 
         lastmod = url_tag.find("lastmod")
         date_posted = lastmod.get_text(strip=True) if lastmod else ""
