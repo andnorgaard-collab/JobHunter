@@ -378,6 +378,46 @@ def _try_odata(session: requests.Session) -> list[dict]:
     return jobs
 
 
+# --- Next.js __NEXT_DATA__ extractor -----------------------------------
+
+def _extract_jobs_from_nextdata(data: dict) -> list[dict]:
+    """
+    Walk the Next.js __NEXT_DATA__ tree looking for job arrays.
+    The structure varies between CSB versions; we try common paths.
+    """
+    import json
+
+    def _walk(node, depth=0):
+        if depth > 8:
+            return []
+        if isinstance(node, list):
+            # Check if this looks like a job list
+            if node and isinstance(node[0], dict):
+                results = [_normalise_job(item) for item in node]
+                results = [r for r in results if r]
+                if len(results) >= 3:   # at least 3 valid jobs → it's a job list
+                    return results
+            for item in node:
+                found = _walk(item, depth + 1)
+                if found:
+                    return found
+        elif isinstance(node, dict):
+            # Common keys where jobs live in CSB __NEXT_DATA__
+            for key in ("jobs", "jobRequisitions", "results", "jobPostings", "data"):
+                if key in node:
+                    found = _walk(node[key], depth + 1)
+                    if found:
+                        return found
+            for v in node.values():
+                if isinstance(v, (dict, list)):
+                    found = _walk(v, depth + 1)
+                    if found:
+                        return found
+        return []
+
+    return _walk(data)
+
+
 # --- Strategy 4: HTML scrape fallback ------------------------------------
 
 def _try_html_scrape(session: requests.Session) -> list[dict]:
@@ -402,6 +442,18 @@ def _try_html_scrape(session: requests.Session) -> list[dict]:
                 continue
 
             soup = BeautifulSoup(resp.text, "html.parser")
+
+            # Next.js server-side data (__NEXT_DATA__)
+            next_script = soup.find("script", id="__NEXT_DATA__")
+            if next_script:
+                try:
+                    nd = json.loads(next_script.string or "")
+                    logger.info("Found __NEXT_DATA__ at %s – scanning for jobs", url)
+                    found = _extract_jobs_from_nextdata(nd)
+                    if found:
+                        return found
+                except (json.JSONDecodeError, AttributeError):
+                    pass
 
             # Look for JSON-LD job postings
             for script in soup.find_all("script", type="application/ld+json"):
@@ -473,40 +525,66 @@ def _try_html_scrape(session: requests.Session) -> list[dict]:
 
 # Workday tenant + site combinations to try.
 # The merger kept some Novozymes infrastructure; we probe common patterns.
-_WD_TENANTS = [
-    ("novonesis",  "Novonesis_Careers"),
-    ("novonesis",  "Novonesis_External"),
-    ("novonesis",  "Novonesis_ExternalCareerSite"),
-    ("novonesis",  "External"),
-    ("novonesis",  "novonesis"),
-    ("novozymes",  "Novozymes"),
-    ("novozymes",  "Novozymes_External"),
-    ("novozymes",  "External"),
-    ("novozymes",  "novozymes"),
+_WD_TENANTS_PRIMARY = ["novonesis", "novozymes"]
+
+# Fallback site names if auto-discovery fails
+_WD_SITE_GUESSES = [
+    "Novonesis", "NovonesisCareers", "Novonesis_Careers",
+    "Novonesis_External", "Novonesis_ExternalCareerSite",
+    "External", "novonesis",
+    "Novozymes", "Novozymes_External", "novozymes",
 ]
 
 # Workday uses numbered data-centres: wd1 … wd5
-_WD_HOSTS = ["wd3", "wd1", "wd5", "wd2"]
+_WD_HOSTS = ["wd3", "wd1", "wd5"]
+
+
+def _wd_discover_site(session: requests.Session, host: str, tenant: str) -> Optional[str]:
+    """
+    GET the Workday tenant root and extract the career-site name from the redirect URL.
+    Workday redirects / → /en-US/{SiteName}/ which reveals the correct site name.
+    """
+    import re
+    url = f"https://{tenant}.{host}.myworkdayjobs.com/"
+    try:
+        resp = session.get(url, timeout=15, allow_redirects=True)
+        # The final URL after redirects contains the site name
+        final = resp.url
+        match = re.search(r"/en-[A-Z]{2}/([^/?#]+)", final)
+        if match:
+            site = match.group(1)
+            logger.info("Workday auto-discovered site: %s.%s → %s", tenant, host, site)
+            return site
+    except Exception as exc:
+        logger.debug("Workday site discovery failed (%s.%s): %s", tenant, host, exc)
+    return None
 
 
 def _fetch_novonesis(session: requests.Session) -> list[dict]:
     """
-    Fetch jobs from Novonesis via Workday's public CXS (career-experience) API.
-
-    Workday exposes a POST endpoint at:
-      https://{tenant}.{host}.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs
-    which requires no authentication and returns JSON.
+    Fetch jobs from Novonesis via Workday's public CXS API.
+    First auto-discovers the career-site name, then falls back to guesses.
     """
     for host in _WD_HOSTS:
-        for tenant, site in _WD_TENANTS:
-            jobs = _wd_fetch_all_pages(session, host, tenant, site)
-            if jobs:
-                logger.info(
-                    "Novonesis via Workday (%s.%s.myworkdayjobs.com / %s): %d jobs",
-                    tenant, host, site, len(jobs),
-                )
-                for j in jobs:
-                    j["company"] = "Novonesis"
+        for tenant in _WD_TENANTS_PRIMARY:
+            # Try auto-discovery first
+            discovered = _wd_discover_site(session, host, tenant)
+            sites_to_try = (
+                [discovered] + _WD_SITE_GUESSES if discovered
+                else _WD_SITE_GUESSES
+            )
+
+            for site in sites_to_try:
+                if not site:
+                    continue
+                jobs = _wd_fetch_all_pages(session, host, tenant, site)
+                if jobs:
+                    logger.info(
+                        "Novonesis via Workday (%s.%s / %s): %d jobs",
+                        tenant, host, site, len(jobs),
+                    )
+                    for j in jobs:
+                        j["company"] = "Novonesis"
                 return jobs
         time.sleep(REQUEST_DELAY)
 
@@ -534,7 +612,10 @@ def _wd_fetch_all_pages(
             resp = session.post(
                 base_url,
                 json={"appliedFacets": {}, "limit": page_size, "offset": offset, "searchText": ""},
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/plain, */*",
+                },
                 timeout=30,
             )
             if resp.status_code != 200:
