@@ -71,6 +71,7 @@ class ScoredJob:
 EXCLUSION_PATTERNS: list[str] = [
     # Pure science / lab
     r"\bscientist\b",
+    r"\bscientific\b",          # Scientific Director, Scientific Advisor, etc.
     r"\bresearch(?:er)?\b",
     r"\bpostdoc\b",
     r"\bphd\s+stud",
@@ -98,6 +99,10 @@ EXCLUSION_PATTERNS: list[str] = [
     r"\bpayroll\b",
     r"\baudit(?:or)?\b",
     r"\btax\s+(?:manager|specialist|analyst)\b",
+    r"\bvaluation\b",           # Sustainability/finance valuation roles
+    # Legal / communications
+    r"\bcounsel\b",
+    r"\bpatent\s+(?:agent|attorney|counsel)\b",
 ]
 
 
@@ -240,6 +245,9 @@ _LOCATION_PRIORITY: list[str] = [
     r"\bcopenhagen\b", r"\bk[oø]benhavn\b",
     r"\bbagsv[aæ]rd\b", r"\bm[åa]l[øo]v\b", r"\bkalundborg\b",
     r"\bh[oø]rsholm\b", r"\bgen(?:tofte|tof)\b",
+    r"\bs[oø]borg\b",           # Major NN site (Gladsaxe/Copenhagen area)
+    r"\bgladsaxe\b",
+    r"\bhiller[oø]d\b",
 ]
 _LOCATION_SECONDARY: list[str] = [
     r"\bhybrid\b", r"\bremote\b",

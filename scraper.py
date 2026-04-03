@@ -207,6 +207,10 @@ def _parse_sitemap_jobs(soup) -> list[dict]:
         if not title or not re.search(r"[a-zA-Z]", title):
             continue
 
+        # Normalise URL-slug artefacts: "Sr_" → "Senior", trailing/leading underscores
+        title = re.sub(r"\bSr_\b", "Senior", title)
+        title = title.replace("_", " ").strip()
+
         lastmod = url_tag.find("lastmod")
         date_posted = lastmod.get_text(strip=True) if lastmod else ""
 
