@@ -295,9 +295,9 @@ def _send_smtp(
     html_body: str,
     text_body: str,
 ) -> bool:
-    smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
-    smtp_user = os.environ.get("SMTP_USER", from_email)
+    smtp_host = os.environ.get("SMTP_HOST") or "smtp.gmail.com"
+    smtp_port = int(os.environ.get("SMTP_PORT") or "587")
+    smtp_user = os.environ.get("SMTP_USER") or from_email
     smtp_password = os.environ.get("SMTP_PASSWORD", "")
 
     if not smtp_password:
