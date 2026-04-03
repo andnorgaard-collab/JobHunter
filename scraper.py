@@ -74,6 +74,7 @@ def fetch_all_jobs() -> list[dict]:
 
 def _fetch_novo_nordisk(session: requests.Session) -> list[dict]:
     for fn, label in [
+        (_try_nn_sitemap,  "sitemap"),
         (_try_csb_api,     "CSB API"),
         (_try_sf_restapi,  "SF REST API"),
         (_try_xml_feed,    "XML feed"),
@@ -88,6 +89,112 @@ def _fetch_novo_nordisk(session: requests.Session) -> list[dict]:
             return jobs
     logger.warning("Novo Nordisk: all strategies failed.")
     return []
+
+
+# --- Strategy 0: XML sitemap (works even for pure CSR sites) -------------
+
+def _try_nn_sitemap(session: requests.Session) -> list[dict]:
+    """
+    Parse the careers sitemap to extract job URLs.
+    SF CSB publishes sitemaps for SEO even when the site is CSR-only.
+    Job URLs encode title and location in the slug, e.g.:
+      /job/Bagsvaerd-Denmark/Operations-Manager_R-123456
+    """
+    import re
+
+    candidate_sitemaps = [
+        f"{CAREERS_BASE}/sitemap.xml",
+        f"{CAREERS_BASE}/sitemap-jobs.xml",
+        f"{CAREERS_BASE}/sitemap_jobs.xml",
+        f"{CAREERS_BASE}/job-sitemap.xml",
+    ]
+
+    for sitemap_url in candidate_sitemaps:
+        try:
+            resp = session.get(sitemap_url, timeout=30,
+                               headers={"Accept": "text/xml,application/xml,*/*"})
+            if resp.status_code != 200:
+                logger.debug("Sitemap %s → HTTP %d", sitemap_url, resp.status_code)
+                continue
+
+            logger.info("Sitemap found at %s", sitemap_url)
+            soup = BeautifulSoup(resp.content, "xml")
+
+            # Sitemap index → drill into child sitemaps that mention "job"
+            for sm in soup.find_all("sitemap"):
+                loc_tag = sm.find("loc")
+                if loc_tag and "job" in loc_tag.get_text().lower():
+                    child = session.get(loc_tag.get_text(strip=True), timeout=30)
+                    if child.status_code == 200:
+                        child_soup = BeautifulSoup(child.content, "xml")
+                        jobs = _parse_sitemap_jobs(child_soup)
+                        if jobs:
+                            return jobs
+
+            jobs = _parse_sitemap_jobs(soup)
+            if jobs:
+                return jobs
+
+        except Exception as exc:
+            logger.debug("Sitemap error %s: %s", sitemap_url, exc)
+
+    return []
+
+
+def _parse_sitemap_jobs(soup) -> list[dict]:
+    """
+    Extract job dicts from a parsed sitemap.
+    Expects URLs like /job/{City}-{Country}/{Title}_{JobId}
+    or              /job/{City}-{Country}-{Title}_{JobId}
+    """
+    import re
+
+    jobs: list[dict] = []
+    for url_tag in soup.find_all("url"):
+        loc_tag = url_tag.find("loc")
+        if not loc_tag:
+            continue
+        url = loc_tag.get_text(strip=True)
+        if "/job/" not in url.lower():
+            continue
+
+        # Extract the path segment after /job/
+        m = re.search(r"/job/([^?#]+)", url, re.IGNORECASE)
+        if not m:
+            continue
+        slug = m.group(1).rstrip("/")
+
+        # Split on underscore to separate title-slug from job-id
+        # e.g. "Bagsvaerd-Denmark/Senior-Operations-Manager_R-12345"
+        #   or "Bagsvaerd-Denmark-Senior-Operations-Manager_R-12345"
+        parts = slug.rsplit("_", 1)
+        job_id = parts[-1] if len(parts) > 1 else re.sub(r"[^A-Za-z0-9-]", "", slug)
+
+        slug_body = parts[0] if len(parts) > 1 else slug
+
+        # If there's a "/" separator, first segment is location, rest is title
+        if "/" in slug_body:
+            loc_part, title_part = slug_body.split("/", 1)
+            location = loc_part.replace("-", " ").title()
+            title = title_part.replace("-", " ").title()
+        else:
+            # All dashes — try to split on a known country/city name
+            location = ""
+            title = slug_body.replace("-", " ").title()
+
+        lastmod = url_tag.find("lastmod")
+        date_posted = lastmod.get_text(strip=True) if lastmod else ""
+
+        jobs.append({
+            "id": f"nn_{job_id}",
+            "title": title,
+            "location": location,
+            "date_posted": date_posted,
+            "url": url,
+        })
+
+    logger.info("Sitemap: parsed %d job URLs", len(jobs))
+    return jobs
 
 
 # --- Strategy 1: Career Site Builder REST API ----------------------------
@@ -603,21 +710,68 @@ _WD_SITE_GUESSES = [
 _WD_HOSTS = ["wd3", "wd1", "wd5"]
 
 
+def _wd_discover_from_page(session: requests.Session) -> Optional[tuple]:
+    """
+    Fetch the Novonesis main careers page and extract the embedded Workday URL.
+    Returns (tenant, host, site) or None.
+    """
+    import re
+    careers_urls = [
+        "https://www.novonesis.com/en/careers/jobs",
+        "https://www.novonesis.com/en/careers",
+        "https://www.novonesis.com/careers",
+    ]
+    for url in careers_urls:
+        try:
+            resp = session.get(
+                url, timeout=20,
+                headers={**HEADERS, "Accept": "text/html,application/xhtml+xml,*/*"},
+            )
+            if resp.status_code != 200:
+                continue
+            # Look for myworkdayjobs.com URLs in the HTML
+            pattern = r"https?://([a-zA-Z0-9-]+)\.(wd\d+)\.myworkdayjobs\.com(?:/[^\"']*)?/en-[A-Z]{2}/([^/\"'?#]+)"
+            m = re.search(pattern, resp.text)
+            if m:
+                tenant, host, site = m.group(1), m.group(2), m.group(3)
+                logger.info("Discovered Workday URL from %s: %s.%s / %s", url, tenant, host, site)
+                return tenant, host, site
+            # Tenant/host without site
+            m2 = re.search(r"([a-zA-Z0-9-]+)\.(wd\d+)\.myworkdayjobs\.com", resp.text)
+            if m2:
+                logger.info("Discovered Workday tenant from %s: %s.%s", url, m2.group(1), m2.group(2))
+                return m2.group(1), m2.group(2), None
+        except Exception as exc:
+            logger.debug("Novonesis page discovery error %s: %s", url, exc)
+    return None
+
+
 def _wd_discover_site(session: requests.Session, host: str, tenant: str) -> Optional[str]:
     """
-    GET the Workday tenant root and extract the career-site name from the redirect URL.
+    GET the Workday tenant root with browser-like headers and extract
+    the career-site name from the redirect URL.
     Workday redirects / → /en-US/{SiteName}/ which reveals the correct site name.
     """
     import re
     url = f"https://{tenant}.{host}.myworkdayjobs.com/"
     try:
-        resp = session.get(url, timeout=15, allow_redirects=True)
-        # The final URL after redirects contains the site name
+        resp = session.get(
+            url, timeout=15, allow_redirects=True,
+            headers={**HEADERS, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+        )
         final = resp.url
         match = re.search(r"/en-[A-Z]{2}/([^/?#]+)", final)
         if match:
             site = match.group(1)
             logger.info("Workday auto-discovered site: %s.%s → %s", tenant, host, site)
+            return site
+        # Also scan the response body for the site name
+        body_match = re.search(
+            rf"/{tenant}/([^/\"'?#]+)/jobs", resp.text, re.IGNORECASE
+        )
+        if body_match:
+            site = body_match.group(1)
+            logger.info("Workday site from body: %s.%s → %s", tenant, host, site)
             return site
     except Exception as exc:
         logger.debug("Workday site discovery failed (%s.%s): %s", tenant, host, exc)
@@ -627,11 +781,31 @@ def _wd_discover_site(session: requests.Session, host: str, tenant: str) -> Opti
 def _fetch_novonesis(session: requests.Session) -> list[dict]:
     """
     Fetch jobs from Novonesis via Workday's public CXS API.
-    First auto-discovers the career-site name, then falls back to guesses.
+    1. Try to discover tenant/site from the Novonesis careers page HTML.
+    2. Fall back to probing known tenants + auto-discovery from Workday root.
+    3. Fall back to guessing site names.
     """
-    for host in _WD_HOSTS:
-        for tenant in _WD_TENANTS_PRIMARY:
-            # Try auto-discovery first
+    # Step 1: parse the Novonesis website for an embedded Workday URL
+    found = _wd_discover_from_page(session)
+    if found:
+        tenant, host, site = found
+        if site:
+            jobs = _wd_fetch_all_pages(session, host, tenant, site)
+            if jobs:
+                logger.info("Novonesis via page-discovered site (%s.%s/%s): %d jobs", tenant, host, site, len(jobs))
+                for j in jobs:
+                    j["company"] = "Novonesis"
+                return jobs
+        # We found tenant+host but not site — add to guesses below
+        hosts_to_try = [host] + [h for h in _WD_HOSTS if h != host]
+        tenants_to_try = [tenant] + [t for t in _WD_TENANTS_PRIMARY if t != tenant]
+    else:
+        hosts_to_try = _WD_HOSTS
+        tenants_to_try = _WD_TENANTS_PRIMARY
+
+    # Step 2+3: probe known combinations with root auto-discovery + guesses
+    for host in hosts_to_try:
+        for tenant in tenants_to_try:
             discovered = _wd_discover_site(session, host, tenant)
             sites_to_try = (
                 [discovered] + _WD_SITE_GUESSES if discovered
