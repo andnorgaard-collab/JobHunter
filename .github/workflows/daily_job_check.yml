@@ -61,9 +61,10 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
 
           # ── Optional ──────────────────────────────────────────────────────
-          LOG_LEVEL: INFO
+          LOG_LEVEL: DEBUG  # temporary – shows HTTP status codes per endpoint
         run: |
-          if [ "${{ github.event.inputs.test_email }}" = "yes" ]; then
+          INPUT="${{ github.event.inputs.test_email }}"
+          if [ "${INPUT,,}" = "yes" ]; then
             echo "Running in TEST EMAIL mode..."
             python main.py --test-email
           else

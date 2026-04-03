@@ -117,13 +117,13 @@ def _try_csb_api(session: requests.Session, max_pages: int = 40) -> list[dict]:
                 json={"company": SF_COMPANY, "locale": "en_US", "pageNumber": 0, "pageSize": 1},
                 timeout=20,
             )
+            logger.warning("CSB probe %s → HTTP %d", url, probe.status_code)
             if probe.status_code == 200:
                 probe.json()  # verify JSON
                 working_url = url
-                logger.debug("CSB API probe succeeded: %s", url)
                 break
         except Exception as exc:
-            logger.debug("CSB API probe failed for %s: %s", url, exc)
+            logger.warning("CSB probe %s → error: %s", url, exc)
         time.sleep(0.5)
 
     if not working_url:
@@ -471,18 +471,22 @@ def _try_html_scrape(session: requests.Session) -> list[dict]:
 # Novonesis – Workday scraper
 # =============================================================================
 
-# Workday tenant slugs to try (the merger may have kept the Novozymes tenant
-# for a while, so we probe both).
+# Workday tenant + site combinations to try.
+# The merger kept some Novozymes infrastructure; we probe common patterns.
 _WD_TENANTS = [
     ("novonesis",  "Novonesis_Careers"),
     ("novonesis",  "Novonesis_External"),
+    ("novonesis",  "Novonesis_ExternalCareerSite"),
     ("novonesis",  "External"),
-    ("novozymes",  "Novozymes"),          # legacy, kept as fallback
+    ("novonesis",  "novonesis"),
+    ("novozymes",  "Novozymes"),
+    ("novozymes",  "Novozymes_External"),
     ("novozymes",  "External"),
+    ("novozymes",  "novozymes"),
 ]
 
 # Workday uses numbered data-centres: wd1 … wd5
-_WD_HOSTS = ["wd3", "wd1", "wd5"]
+_WD_HOSTS = ["wd3", "wd1", "wd5", "wd2"]
 
 
 def _fetch_novonesis(session: requests.Session) -> list[dict]:
@@ -534,6 +538,7 @@ def _wd_fetch_all_pages(
                 timeout=30,
             )
             if resp.status_code != 200:
+                logger.warning("Workday %s/%s → HTTP %d", tenant, site, resp.status_code)
                 break
             data = resp.json()
 
