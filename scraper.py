@@ -75,6 +75,7 @@ def fetch_all_jobs() -> list[dict]:
 def _fetch_novo_nordisk(session: requests.Session) -> list[dict]:
     for fn, label in [
         (_try_csb_api,     "CSB API"),
+        (_try_sf_restapi,  "SF REST API"),
         (_try_xml_feed,    "XML feed"),
         (_try_odata,       "OData"),
         (_try_html_scrape, "HTML scrape"),
@@ -108,22 +109,32 @@ def _try_csb_api(session: requests.Session, max_pages: int = 40) -> list[dict]:
     ]
 
     working_url: Optional[str] = None
+    csb_headers = {
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/json",
+        "Referer": f"{CAREERS_BASE}/",
+    }
 
-    # Probe which endpoint responds
+    # Probe which endpoint responds (try POST, then GET)
     for url in candidate_urls:
-        try:
-            probe = session.post(
-                url,
-                json={"company": SF_COMPANY, "locale": "en_US", "pageNumber": 0, "pageSize": 1},
-                timeout=20,
-            )
-            logger.warning("CSB probe %s → HTTP %d", url, probe.status_code)
-            if probe.status_code == 200:
-                probe.json()  # verify JSON
-                working_url = url
-                break
-        except Exception as exc:
-            logger.warning("CSB probe %s → error: %s", url, exc)
+        for method in ("post", "get"):
+            try:
+                kwargs = {"timeout": 20, "headers": csb_headers}
+                if method == "post":
+                    kwargs["json"] = {"company": SF_COMPANY, "locale": "en_US", "pageNumber": 0, "pageSize": 1}
+                else:
+                    kwargs["params"] = {"company": SF_COMPANY, "locale": "en_US", "pageNumber": 0, "pageSize": 1}
+                probe = getattr(session, method)(url, **kwargs)
+                logger.warning("CSB probe %s [%s] → HTTP %d", url, method.upper(), probe.status_code)
+                if probe.status_code == 200:
+                    probe.json()  # verify JSON
+                    working_url = url
+                    break
+            except Exception as exc:
+                logger.warning("CSB probe %s [%s] → error: %s", url, method.upper(), exc)
+            time.sleep(0.3)
+        if working_url:
+            break
         time.sleep(0.5)
 
     if not working_url:
@@ -378,6 +389,56 @@ def _try_odata(session: requests.Session) -> list[dict]:
     return jobs
 
 
+# --- Strategy 3b: SAP SF public REST API --------------------------------
+
+def _try_sf_restapi(session: requests.Session) -> list[dict]:
+    """
+    SAP SuccessFactors exposes a public careers REST API at /restapi/v1/jobReqs.
+    This is separate from OData and sometimes publicly accessible.
+    """
+    candidate_urls = [
+        f"{SF_BASE}/restapi/v1/jobReqs",
+        f"{CAREERS_BASE}/restapi/v1/jobReqs",
+    ]
+
+    for base in candidate_urls:
+        jobs: list[dict] = []
+        page = 1
+        while True:
+            params = {
+                "company": SF_COMPANY,
+                "language": "en_US",
+                "format": "json",
+                "pageSize": 100,
+                "pageNumber": page,
+                "status": "approved",
+            }
+            try:
+                resp = session.get(base, params=params, timeout=30)
+                logger.warning("SF REST %s → HTTP %d", base, resp.status_code)
+                if resp.status_code != 200:
+                    break
+                data = resp.json()
+                page_jobs = _parse_json_response(data)
+                if not page_jobs:
+                    break
+                jobs.extend(page_jobs)
+                total = data.get("total") or data.get("totalRecords") or 0
+                if total and len(jobs) >= int(total):
+                    break
+                if len(page_jobs) < 100:
+                    break
+                page += 1
+                time.sleep(REQUEST_DELAY)
+            except Exception as exc:
+                logger.debug("SF REST error %s page %d: %s", base, page, exc)
+                break
+        if jobs:
+            return jobs
+
+    return []
+
+
 # --- Next.js __NEXT_DATA__ extractor -----------------------------------
 
 def _extract_jobs_from_nextdata(data: dict) -> list[dict]:
@@ -431,6 +492,9 @@ def _try_html_scrape(session: requests.Session) -> list[dict]:
 
     urls_to_try = [
         f"{CAREERS_BASE}/",
+        f"{CAREERS_BASE}/jobs",
+        f"{CAREERS_BASE}/search-results",
+        f"{CAREERS_BASE}/en/search-results",
         f"{CAREERS_BASE}/careers",
         f"https://www.novonordisk.com/careers/job-listings.html",
     ]
@@ -585,7 +649,7 @@ def _fetch_novonesis(session: requests.Session) -> list[dict]:
                     )
                     for j in jobs:
                         j["company"] = "Novonesis"
-                return jobs
+                    return jobs
         time.sleep(REQUEST_DELAY)
 
     logger.warning("Novonesis: all Workday tenants/sites returned 0 results.")
