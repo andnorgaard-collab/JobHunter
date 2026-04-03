@@ -743,11 +743,78 @@ _NV_BASE = "https://www.novonesis.com"
 _NV_SLUG = "novonesis"   # used as company slug for ATS API guesses
 
 
+def _nv_sitemap(session: requests.Session) -> list[dict]:
+    """Try the Novonesis XML sitemap — often not rate-limited like page requests."""
+    import re
+    from urllib.parse import unquote
+
+    sitemap_urls = [
+        f"{_NV_BASE}/sitemap.xml",
+        f"{_NV_BASE}/en/sitemap.xml",
+    ]
+    for sitemap_url in sitemap_urls:
+        try:
+            resp = session.get(sitemap_url, timeout=20,
+                               headers={"Accept": "text/xml,application/xml,*/*"})
+            logger.debug("Novonesis sitemap %s → HTTP %d", sitemap_url, resp.status_code)
+            if resp.status_code != 200:
+                continue
+            soup = BeautifulSoup(resp.content, "xml")
+            # Look for a jobs sub-sitemap
+            for sm in soup.find_all("sitemap"):
+                loc_tag = sm.find("loc")
+                if loc_tag and "job" in loc_tag.get_text().lower():
+                    child = session.get(loc_tag.get_text(strip=True), timeout=20)
+                    if child.status_code == 200:
+                        child_soup = BeautifulSoup(child.content, "xml")
+                        jobs = _nv_parse_sitemap_jobs(child_soup)
+                        if jobs:
+                            return jobs
+            # Direct job URLs in the sitemap
+            jobs = _nv_parse_sitemap_jobs(soup)
+            if jobs:
+                return jobs
+        except Exception as exc:
+            logger.debug("Novonesis sitemap error %s: %s", sitemap_url, exc)
+    return []
+
+
+def _nv_parse_sitemap_jobs(soup) -> list[dict]:
+    """Extract Novonesis job URLs from a sitemap soup object."""
+    import re
+    from urllib.parse import unquote
+    jobs = []
+    for url_tag in soup.find_all("url"):
+        loc_tag = url_tag.find("loc")
+        if not loc_tag:
+            continue
+        url = loc_tag.get_text(strip=True)
+        # Novonesis job pages contain /jobs/ or /job/ in path
+        if not re.search(r"/jobs?/", url, re.IGNORECASE):
+            continue
+        slug = unquote(url.rstrip("/").split("/")[-1])
+        title = slug.replace("-", " ").title()
+        lastmod = url_tag.find("lastmod")
+        date_posted = lastmod.get_text(strip=True) if lastmod else ""
+        if date_posted and "T" in date_posted:
+            date_posted = date_posted.split("T")[0]
+        jobs.append({
+            "id": f"nv_site_{slug[:60]}",
+            "title": title,
+            "location": "Denmark",  # Novonesis HQ is Denmark
+            "date_posted": date_posted,
+            "url": url,
+        })
+    logger.debug("Novonesis sitemap: found %d job URLs", len(jobs))
+    return jobs
+
+
 def _fetch_novonesis(session: requests.Session) -> list[dict]:
     for fn, label in [
         (_nv_smartrecruiters, "SmartRecruiters API"),
         (_nv_greenhouse,      "Greenhouse API"),
         (_nv_lever,           "Lever API"),
+        (_nv_sitemap,         "Novonesis sitemap"),
         (_nv_website,         "Novonesis website"),
     ]:
         jobs = fn(session)
@@ -767,7 +834,7 @@ def _nv_smartrecruiters(session: requests.Session) -> list[dict]:
     for slug in slugs:
         try:
             url = f"https://api.smartrecruiters.com/v1/companies/{slug}/postings"
-            resp = session.get(url, params={"limit": 100, "status": "PUBLIC"}, timeout=20)
+            resp = session.get(url, params={"limit": 100}, timeout=20)
             logger.debug("SmartRecruiters %s → HTTP %d", slug, resp.status_code)
             if resp.status_code != 200:
                 continue
@@ -871,11 +938,11 @@ def _nv_website(session: requests.Session) -> list[dict]:
     browser_headers = {**HEADERS, "Accept": "text/html,application/xhtml+xml,*/*"}
 
     for url in urls:
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 resp = session.get(url, timeout=25, headers=browser_headers)
                 if resp.status_code == 429:
-                    wait = 5 * (attempt + 1)
+                    wait = 3 * (attempt + 1)
                     logger.debug("Novonesis website 429, retry in %ds", wait)
                     time.sleep(wait)
                     continue
@@ -1043,6 +1110,9 @@ def _fetch_nnfonden(session: requests.Session) -> list[dict]:
                 location = f"{city}, {country}".strip(", ") if country else city
             else:
                 location = str(loc)
+            # NNF is always Copenhagen-based; default when API omits location
+            if not location:
+                location = "Copenhagen, Denmark"
 
             date_posted = p.get("created_at") or p.get("published_on") or ""
             # Trim ISO timestamp to date only
