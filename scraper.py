@@ -369,11 +369,15 @@ def _fetch_novonesis(session: requests.Session) -> list[dict]:
 
 
 def _nv_smartrecruiters(session: requests.Session) -> list[dict]:
-    resp = session.get(
-        "https://api.smartrecruiters.com/v1/companies/novonesis/postings",
-        params={"limit": 100},
-        timeout=20,
-    )
+    # Try both current (novonesis) and legacy (novozymes) SmartRecruiters slugs
+    for slug in ("novonesis", "novozymes"):
+        resp = session.get(
+            f"https://api.smartrecruiters.com/v1/companies/{slug}/postings",
+            params={"limit": 100},
+            timeout=20,
+        )
+        if resp.status_code == 200:
+            break
     if resp.status_code != 200:
         return []
     data = resp.json()
