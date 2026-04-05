@@ -71,6 +71,14 @@ def send_alert(
 # Email rendering
 # ---------------------------------------------------------------------------
 
+def _full_scan_banner() -> str:
+    return (
+        '<p style="margin:0 0 8px; font-size:12px; background:#fff3cd; '
+        'border:1px solid #ffc107; border-radius:4px; padding:6px 10px; color:#856404;">'
+        '🔍 <strong>Fuld scanning</strong> — viser alle nuværende stillinger, ikke kun nye.</p>'
+    )
+
+
 def _render_html(strong: list[dict], possible: list[dict], stats: dict) -> str:
     today = date.today().strftime("%d %b %Y")
     sections = ""
@@ -88,6 +96,7 @@ def _render_html(strong: list[dict], possible: list[dict], stats: dict) -> str:
 
     summary_rows = _html_stats_table(stats)
     total_matches = len(strong) + len(possible)
+    full_scan = stats.get("full_scan", False)
 
     return f"""<!DOCTYPE html>
 <html lang="da">
@@ -116,8 +125,9 @@ def _render_html(strong: list[dict], possible: list[dict], stats: dict) -> str:
         📊 Dagens overblik
       </h2>
       {summary_rows}
+      {_full_scan_banner() if full_scan else ""}
       <p style="margin:14px 0 24px; color:#444; font-size:14px;">
-        <strong>{total_matches}</strong> job matcher din profil i dag
+        <strong>{total_matches}</strong> job matcher din profil
         ({len(strong)} stærke, {len(possible)} mulige).
       </p>
 

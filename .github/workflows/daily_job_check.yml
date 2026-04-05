@@ -14,6 +14,10 @@ on:
         description: "Send a test email instead of scraping (yes/no)"
         required: false
         default: "no"
+      full_scan:
+        description: "Match ALL current jobs, not just new ones — use once to get a full overview (yes/no)"
+        required: false
+        default: "no"
 
 jobs:
   check-jobs:
@@ -61,7 +65,8 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
 
           # ── Optional ──────────────────────────────────────────────────────
-          LOG_LEVEL: DEBUG  # temporary – shows HTTP status codes per endpoint
+          LOG_LEVEL: INFO
+          FULL_SCAN: ${{ github.event.inputs.full_scan }}
         run: |
           INPUT="${{ github.event.inputs.test_email }}"
           if [ "${INPUT,,}" = "yes" ]; then

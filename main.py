@@ -77,7 +77,12 @@ def save_seen_ids(seen_ids: set[str]) -> None:
 
 def run() -> int:
     """Execute one monitoring cycle. Returns exit code (0 = success)."""
-    logger.info("=== Job monitor started ===")
+    full_scan = os.environ.get("FULL_SCAN", "").lower() in ("yes", "true", "1")
+
+    if full_scan:
+        logger.info("=== Job monitor started (FULL SCAN — matching all current jobs) ===")
+    else:
+        logger.info("=== Job monitor started ===")
 
     # 1. Load state
     seen_ids = load_seen_ids()
@@ -90,17 +95,24 @@ def run() -> int:
 
     logger.info("Fetched %d total jobs.", len(all_jobs))
 
-    # 3. Filter to only new (unseen) jobs
-    new_jobs = [j for j in all_jobs if j["id"] not in seen_ids]
-    logger.info("%d new jobs (not seen before).", len(new_jobs))
+    # 3. Determine which jobs to match
+    if full_scan:
+        # Match everything — ignore seen_jobs.json
+        jobs_to_match = all_jobs
+        new_count = len([j for j in all_jobs if j["id"] not in seen_ids])
+        logger.info("Full scan: matching all %d jobs (of which %d are new).", len(all_jobs), new_count)
+    else:
+        jobs_to_match = [j for j in all_jobs if j["id"] not in seen_ids]
+        new_count = len(jobs_to_match)
+        logger.info("%d new jobs (not seen before).", new_count)
 
-    # 4. Match / classify new jobs
-    classified = matcher.classify_jobs(new_jobs) if new_jobs else {"strong": [], "possible": []}
+    # 4. Match / classify
+    classified = matcher.classify_jobs(jobs_to_match) if jobs_to_match else {"strong": [], "possible": []}
     strong = classified["strong"]
     possible = classified["possible"]
     logger.info(
-        "Matching results: %d strong, %d possible (out of %d new).",
-        len(strong), len(possible), len(new_jobs),
+        "Matching results: %d strong, %d possible (out of %d checked).",
+        len(strong), len(possible), len(jobs_to_match),
     )
 
     # 5. Build stats for the daily summary section
@@ -108,8 +120,9 @@ def run() -> int:
     by_company = Counter(j["company"] for j in all_jobs)
     stats = {
         "total_scraped": len(all_jobs),
-        "new_jobs": len(new_jobs),
+        "new_jobs": new_count,
         "by_company": dict(by_company),
+        "full_scan": full_scan,
     }
 
     # 6. Always send the daily email
