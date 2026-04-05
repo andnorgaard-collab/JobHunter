@@ -1,56 +1,34 @@
 """
-scraper.py — Fetches job listings from Jobindex RSS feeds.
+scraper.py — Fetches job listings for 5 monitored companies.
 
-Jobindex provides server-rendered RSS feeds for company searches:
-  https://www.jobindex.dk/jobsoegning/rss?virksomhed=COMPANY_NAME
-
-This bypasses JavaScript rendering issues with the HTML search page.
-
-Companies monitored:
-  - Novo Nordisk
-  - Novonesis
-  - Novo Nordisk Fonden
-  - Genmab
-  - Lundbeck
+Strategy per company:
+  Novo Nordisk        → SAP SuccessFactors CSB sitemap (careers.novonordisk.com)
+  Novo Nordisk Fonden → Workable widget API
+  Genmab              → Workday CXS API (genmab.wd3.myworkdayjobs.com)
+  Lundbeck            → SAP SuccessFactors CSB sitemap (jobs.lundbeck)
+  Novonesis           → SmartRecruiters → Workday → sitemap → website
 """
 
 import logging
 import re
 import time
-import urllib.parse
-import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
+from urllib.parse import unquote
 
 import requests
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-JOBINDEX_RSS = "https://www.jobindex.dk/jobsoegning/rss"
-
-REQUEST_DELAY = 2.0  # seconds between company requests
+REQUEST_DELAY = 2.0
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
     ),
-    "Accept": "application/rss+xml, application/xml, text/xml, */*",
-    "Accept-Language": "da-DK,da;q=0.9,en;q=0.8",
+    "Accept": "application/json, text/html, */*",
+    "Accept-Language": "en-US,en;q=0.9,da;q=0.8",
 }
-
-# (display name, virksomhed= query parameter)
-COMPANIES = [
-    ("Novo Nordisk",        "Novo Nordisk"),
-    ("Novonesis",           "Novonesis"),
-    ("Novo Nordisk Fonden", "Novo Nordisk Fonden"),
-    ("Genmab",              "Genmab"),
-    ("Lundbeck",            "Lundbeck"),
-]
 
 
 # ---------------------------------------------------------------------------
@@ -58,154 +36,445 @@ COMPANIES = [
 # ---------------------------------------------------------------------------
 
 def fetch_all_jobs() -> list[dict]:
-    """Return job dicts from all monitored companies via Jobindex RSS."""
     session = requests.Session()
     session.headers.update(HEADERS)
 
     all_jobs: list[dict] = []
 
-    for company_name, query in COMPANIES:
-        jobs = _fetch_company(session, company_name, query)
-        logger.info("%s: %d jobs fetched", company_name, len(jobs))
+    for fn, company in [
+        (_fetch_novo_nordisk,  "Novo Nordisk"),
+        (_fetch_nnfonden,      "Novo Nordisk Fonden"),
+        (_fetch_genmab,        "Genmab"),
+        (_fetch_lundbeck,      "Lundbeck"),
+        (_fetch_novonesis,     "Novonesis"),
+    ]:
+        jobs = fn(session)
+        for j in jobs:
+            j["company"] = company
+        logger.info("%s: %d jobs fetched", company, len(jobs))
         all_jobs.extend(jobs)
         time.sleep(REQUEST_DELAY)
-
-    if not all_jobs:
-        logger.warning("All RSS feeds returned 0 jobs.")
 
     return all_jobs
 
 
 # ---------------------------------------------------------------------------
-# Per-company RSS fetcher
+# Novo Nordisk — SAP SuccessFactors CSB sitemap
 # ---------------------------------------------------------------------------
 
-def _fetch_company(
-    session: requests.Session,
-    company_name: str,
-    query: str,
-) -> list[dict]:
-    """Fetch all Jobindex RSS items for one company."""
-    params = {"virksomhed": query}
-    url = f"{JOBINDEX_RSS}?{urllib.parse.urlencode(params)}"
+_NN_BASE = "https://careers.novonordisk.com"
 
-    try:
-        resp = session.get(url, timeout=30)
-    except requests.RequestException as exc:
-        logger.warning("%s: request error: %s", company_name, exc)
-        return []
-
-    if resp.status_code != 200:
-        logger.warning("%s: HTTP %d from RSS feed", company_name, resp.status_code)
-        return []
-
-    logger.debug("%s: RSS feed → %d bytes", company_name, len(resp.content))
-    return _parse_rss(resp.content, company_name)
+def _fetch_novo_nordisk(session: requests.Session) -> list[dict]:
+    for sitemap_url in [
+        f"{_NN_BASE}/sitemap.xml",
+        f"{_NN_BASE}/sitemap-jobs.xml",
+    ]:
+        try:
+            resp = session.get(sitemap_url, timeout=30,
+                               headers={"Accept": "text/xml,application/xml,*/*"})
+            if resp.status_code != 200:
+                continue
+            soup = BeautifulSoup(resp.content, "xml")
+            # Drill into child sitemaps that mention jobs
+            for sm in soup.find_all("sitemap"):
+                loc = sm.find("loc")
+                if loc and "job" in loc.get_text().lower():
+                    child = session.get(loc.get_text(strip=True), timeout=30)
+                    if child.status_code == 200:
+                        jobs = _parse_csb_sitemap(BeautifulSoup(child.content, "xml"))
+                        if jobs:
+                            return jobs
+            jobs = _parse_csb_sitemap(soup)
+            if jobs:
+                return jobs
+        except Exception as exc:
+            logger.debug("NN sitemap error: %s", exc)
+    logger.warning("Novo Nordisk: sitemap strategy failed")
+    return []
 
 
 # ---------------------------------------------------------------------------
-# RSS parsing
+# Lundbeck — SAP SuccessFactors CSB sitemap (same format as NN)
 # ---------------------------------------------------------------------------
 
-def _parse_rss(content: bytes, company_name: str) -> list[dict]:
-    """Parse an RSS feed and return job dicts."""
-    try:
-        root = ET.fromstring(content)
-    except ET.ParseError as exc:
-        logger.warning("%s: RSS parse error: %s", company_name, exc)
-        return []
+_LB_BASE = "https://jobs.lundbeck"
 
-    # RSS namespace handling — strip any namespace prefix
-    def _tag(el: ET.Element, name: str) -> str | None:
-        child = el.find(name)
-        if child is None:
-            # Try with common RSS namespaces
-            for ns in ("", "{http://purl.org/rss/1.0/}", "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}"):
-                child = el.find(f"{ns}{name}")
-                if child is not None:
-                    break
-        return child.text.strip() if child is not None and child.text else None
+def _fetch_lundbeck(session: requests.Session) -> list[dict]:
+    for sitemap_url in [
+        f"{_LB_BASE}/sitemap.xml",
+        f"{_LB_BASE}/sitemap-jobs.xml",
+    ]:
+        try:
+            resp = session.get(sitemap_url, timeout=30,
+                               headers={"Accept": "text/xml,application/xml,*/*"})
+            if resp.status_code != 200:
+                logger.debug("Lundbeck sitemap %s → HTTP %d", sitemap_url, resp.status_code)
+                continue
+            soup = BeautifulSoup(resp.content, "xml")
+            for sm in soup.find_all("sitemap"):
+                loc = sm.find("loc")
+                if loc and "job" in loc.get_text().lower():
+                    child = session.get(loc.get_text(strip=True), timeout=30)
+                    if child.status_code == 200:
+                        jobs = _parse_csb_sitemap(BeautifulSoup(child.content, "xml"))
+                        if jobs:
+                            return jobs
+            jobs = _parse_csb_sitemap(soup)
+            if jobs:
+                return jobs
+        except Exception as exc:
+            logger.debug("Lundbeck sitemap error: %s", exc)
+    logger.warning("Lundbeck: sitemap strategy failed")
+    return []
 
+
+# ---------------------------------------------------------------------------
+# Shared: SAP SuccessFactors CSB sitemap parser
+#
+# URL format: /job/{City}-{Title-words}-{StateAbbrev}/{NumericId}/
+# ---------------------------------------------------------------------------
+
+def _parse_csb_sitemap(soup) -> list[dict]:
     jobs: list[dict] = []
-    channel = root.find("channel") or root
-    items = channel.findall("item")
-
-    logger.debug("%s: %d <item> elements in RSS", company_name, len(items))
-
-    for item in items:
-        title     = _tag(item, "title") or ""
-        link      = _tag(item, "link") or ""
-        desc      = _tag(item, "description") or ""
-        pub_date  = _tag(item, "pubDate") or ""
-        guid      = _tag(item, "guid") or link
-
-        if not title or not link:
+    for url_tag in soup.find_all("url"):
+        loc_tag = url_tag.find("loc")
+        if not loc_tag:
+            continue
+        url = loc_tag.get_text(strip=True)
+        if "/job/" not in url.lower():
             continue
 
-        # Build a stable job ID from the Jobindex job ID in the URL
-        job_id = _extract_id(link, guid)
+        m = re.search(r"/job/([^?#]+)", url, re.IGNORECASE)
+        if not m:
+            continue
+        slug = unquote(m.group(1)).rstrip("/")
 
-        # Parse location from description (Jobindex puts it in the RSS desc)
-        location = _extract_location_from_desc(desc)
+        title = location = job_id = ""
 
-        # Parse date
-        date_posted = _parse_date(pub_date)
+        slash_parts = slug.split("/")
+        if len(slash_parts) == 2 and slash_parts[1].isdigit():
+            job_id = slash_parts[1]
+            words = slash_parts[0].split("-")
+            if len(words) >= 3:
+                location = words[0].title()
+                title = " ".join(words[1:-1]).title()
+            elif len(words) == 2:
+                location = words[0].title()
+                title = words[1].title()
+            else:
+                title = slash_parts[0].replace("-", " ").title()
+        elif "_" in slug:
+            parts = slug.rsplit("_", 1)
+            job_id = parts[-1]
+            slug_body = parts[0]
+            if "/" in slug_body:
+                loc_part, title_part = slug_body.split("/", 1)
+                location = loc_part.replace("-", " ").title()
+                title = title_part.replace("-", " ").title()
+            else:
+                title = slug_body.replace("-", " ").title()
+        else:
+            job_id = re.sub(r"[^A-Za-z0-9-]", "", slug)
+            title = slug.replace("-", " ").title()
 
+        if not title or not re.search(r"[a-zA-Z]", title):
+            continue
+
+        title = re.sub(r"\bSr_\b", "Senior", title)
+        title = title.replace("_", " ").strip()
+
+        lastmod = url_tag.find("lastmod")
+        date_posted = lastmod.get_text(strip=True) if lastmod else ""
+
+        # Derive a prefix from the URL base
+        prefix = "lb" if "lundbeck" in url.lower() else "nn"
         jobs.append({
-            "id":          job_id,
-            "title":       title,
-            "location":    location,
+            "id": f"{prefix}_{job_id}",
+            "title": title,
+            "location": location,
             "date_posted": date_posted,
-            "url":         link,
-            "company":     company_name,
+            "url": url,
+        })
+
+    logger.info("CSB sitemap: parsed %d jobs", len(jobs))
+    return jobs
+
+
+# ---------------------------------------------------------------------------
+# Genmab — Workday CXS API
+# ---------------------------------------------------------------------------
+
+_GENMAB_WD_BASE = "https://genmab.wd3.myworkdayjobs.com"
+_GENMAB_TENANT  = "genmab"
+_GENMAB_BOARD   = "Genmab_Careers_Site"
+
+def _fetch_genmab(session: requests.Session) -> list[dict]:
+    api_url = f"{_GENMAB_WD_BASE}/wday/cxs/{_GENMAB_TENANT}/{_GENMAB_BOARD}/jobs"
+    wd_headers = {
+        "Content-Type": "application/json",
+        "Origin": _GENMAB_WD_BASE,
+        "Referer": f"{_GENMAB_WD_BASE}/{_GENMAB_BOARD}",
+    }
+    return _fetch_workday(session, api_url, wd_headers, _GENMAB_WD_BASE, "genmab")
+
+
+def _fetch_workday(
+    session: requests.Session,
+    api_url: str,
+    extra_headers: dict,
+    base_url: str,
+    id_prefix: str,
+    limit: int = 20,
+) -> list[dict]:
+    """Generic Workday CXS API fetcher with pagination."""
+    jobs: list[dict] = []
+    offset = 0
+
+    while True:
+        payload = {
+            "limit": limit,
+            "offset": offset,
+            "searchText": "",
+            "locations": [],
+        }
+        try:
+            resp = session.post(
+                api_url,
+                json=payload,
+                headers=extra_headers,
+                timeout=30,
+            )
+        except requests.RequestException as exc:
+            logger.warning("Workday request error: %s", exc)
+            break
+
+        if resp.status_code != 200:
+            logger.warning("Workday API %s → HTTP %d", api_url, resp.status_code)
+            break
+
+        try:
+            data = resp.json()
+        except Exception:
+            logger.warning("Workday API returned non-JSON")
+            break
+
+        postings = data.get("jobPostings") or []
+        total = data.get("total", 0)
+
+        for p in postings:
+            ext_path = p.get("externalPath", "")
+            title = p.get("title", "").strip()
+            location = p.get("locationsText", "").strip()
+            posted_on = p.get("postedOn", "")
+
+            # Normalise date: "Posted 3 Days Ago" → skip; ISO date kept
+            date_posted = posted_on if re.match(r"\d{4}-\d{2}-\d{2}", posted_on) else ""
+
+            # Build ID from the numeric portion of the externalPath
+            id_match = re.search(r"(\d{5,})", ext_path)
+            job_id = f"{id_prefix}_{id_match.group(1)}" if id_match else f"{id_prefix}_{abs(hash(ext_path))%10_000_000}"
+
+            job_url = base_url + ext_path if ext_path.startswith("/") else ext_path
+
+            if not title:
+                continue
+
+            jobs.append({
+                "id": job_id,
+                "title": title,
+                "location": location,
+                "date_posted": date_posted,
+                "url": job_url,
+            })
+
+        offset += limit
+        if offset >= total or not postings:
+            break
+        time.sleep(0.5)
+
+    logger.info("Workday API %s: %d jobs", api_url, len(jobs))
+    return jobs
+
+
+# ---------------------------------------------------------------------------
+# Novo Nordisk Fonden — Workable widget API
+# ---------------------------------------------------------------------------
+
+_NNF_WORKABLE_SLUG = "novonordiskfoundation"
+_NNF_WORKABLE_URL  = f"https://apply.workable.com/api/v1/widget/accounts/{_NNF_WORKABLE_SLUG}"
+
+def _fetch_nnfonden(session: requests.Session) -> list[dict]:
+    try:
+        resp = session.get(_NNF_WORKABLE_URL, timeout=20,
+                           params={"details": "true"},
+                           headers={"Referer": "https://novonordiskfonden.dk/"})
+        if resp.status_code != 200:
+            logger.warning("NNF Workable → HTTP %d", resp.status_code)
+            return []
+        data = resp.json()
+    except Exception as exc:
+        logger.warning("NNF Workable error: %s", exc)
+        return []
+
+    jobs = []
+    for p in data.get("jobs", []):
+        location = ""
+        loc = p.get("location") or {}
+        if isinstance(loc, dict):
+            city    = loc.get("city", "")
+            country = loc.get("country", "")
+            location = ", ".join(filter(None, [city, country]))
+        elif isinstance(loc, str):
+            location = loc
+
+        if not location:
+            location = "Copenhagen, Denmark"
+
+        job_id = str(p.get("id") or p.get("shortcode") or "")
+        jobs.append({
+            "id": f"nnf_{job_id}",
+            "title": p.get("title", "").strip(),
+            "location": location,
+            "date_posted": (p.get("published_on") or "")[:10],
+            "url": f"https://apply.workable.com/{_NNF_WORKABLE_SLUG}/j/{job_id}/",
         })
 
     return jobs
 
 
-def _extract_id(link: str, guid: str) -> str:
-    """Extract a stable ID from a Jobindex job URL."""
-    # Jobindex URLs: https://www.jobindex.dk/jobannonce/1234567/title
-    for text in (link, guid):
-        m = re.search(r"/jobannonce/(\d+)", text)
-        if m:
-            return f"ji_{m.group(1)}"
-    # Fallback: hash the URL
-    return f"ji_{abs(hash(link)) % 10_000_000}"
+# ---------------------------------------------------------------------------
+# Novonesis — SmartRecruiters → Workday → sitemap → website
+# ---------------------------------------------------------------------------
+
+_NV_BASE = "https://www.novonesis.com"
+
+def _fetch_novonesis(session: requests.Session) -> list[dict]:
+    for fn, label in [
+        (_nv_smartrecruiters, "SmartRecruiters"),
+        (_nv_workday,         "Workday"),
+        (_nv_sitemap,         "sitemap"),
+        (_nv_website,         "website"),
+    ]:
+        try:
+            jobs = fn(session)
+        except Exception as exc:
+            logger.debug("Novonesis %s error: %s", label, exc)
+            jobs = []
+        if jobs:
+            logger.info("Novonesis via %s: %d jobs", label, len(jobs))
+            return jobs
+        logger.debug("Novonesis %s: 0 jobs", label)
+    logger.warning("Novonesis: all strategies returned 0 jobs")
+    return []
 
 
-def _extract_location_from_desc(desc: str) -> str:
-    """
-    Jobindex RSS descriptions look like:
-      '<b>Virksomhed:</b> Novo Nordisk<br><b>Sted:</b> Bagsværd<br>...'
-    Extract the 'Sted:' field.
-    """
-    # Strip HTML tags
-    plain = re.sub(r"<[^>]+>", " ", desc)
-    plain = re.sub(r"\s+", " ", plain).strip()
+def _nv_smartrecruiters(session: requests.Session) -> list[dict]:
+    resp = session.get(
+        "https://api.smartrecruiters.com/v1/companies/novonesis/postings",
+        params={"limit": 100},
+        timeout=20,
+    )
+    if resp.status_code != 200:
+        return []
+    data = resp.json()
+    jobs = []
+    for p in data.get("content", []):
+        loc = p.get("location", {}) or {}
+        location = ", ".join(filter(None, [loc.get("city", ""), loc.get("country", "")]))
+        jobs.append({
+            "id": f"nv_sr_{p.get('id', '')}",
+            "title": p.get("name", "").strip(),
+            "location": location,
+            "date_posted": (p.get("releasedDate") or "")[:10],
+            "url": p.get("ref", ""),
+        })
+    return jobs
 
-    # Try "Sted: <location>" pattern
-    m = re.search(r"Sted\s*:\s*([^|;,\n]+)", plain, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
 
-    # Try "Location: <location>" pattern (English RSS)
-    m = re.search(r"Location\s*:\s*([^|;,\n]+)", plain, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
+def _nv_workday(session: requests.Session) -> list[dict]:
+    """Try common Novonesis/Novozymes Workday tenant names."""
+    for tenant, server, board in [
+        ("novonesis",  "wd3", "Novonesis_External"),
+        ("novonesis",  "wd5", "Novonesis_External"),
+        ("novozymes",  "wd3", "Novozymes_External"),
+    ]:
+        base = f"https://{tenant}.{server}.myworkdayjobs.com"
+        api_url = f"{base}/wday/cxs/{tenant}/{board}/jobs"
+        hdrs = {"Content-Type": "application/json", "Origin": base, "Referer": base}
+        try:
+            jobs = _fetch_workday(session, api_url, hdrs, base, "nv")
+            if jobs:
+                return jobs
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return []
 
-    return ""
+
+def _nv_sitemap(session: requests.Session) -> list[dict]:
+    for sitemap_url in [f"{_NV_BASE}/sitemap.xml", f"{_NV_BASE}/en/sitemap.xml"]:
+        try:
+            resp = session.get(sitemap_url, timeout=20,
+                               headers={"Accept": "text/xml,application/xml,*/*"})
+            if resp.status_code != 200:
+                continue
+            soup = BeautifulSoup(resp.content, "xml")
+            jobs = []
+            for url_tag in soup.find_all("url"):
+                loc = url_tag.find("loc")
+                if not loc:
+                    continue
+                url = loc.get_text(strip=True)
+                if "/careers/jobs/" not in url and "/job/" not in url:
+                    continue
+                slug = url.rstrip("/").split("/")[-1]
+                title = slug.replace("-", " ").title()
+                if not title or not re.search(r"[a-zA-Z]", title):
+                    continue
+                jobs.append({
+                    "id": f"nv_sm_{abs(hash(url)) % 10_000_000}",
+                    "title": title,
+                    "location": "Denmark",
+                    "date_posted": "",
+                    "url": url,
+                })
+            if jobs:
+                return jobs
+        except Exception as exc:
+            logger.debug("Novonesis sitemap %s: %s", sitemap_url, exc)
+    return []
 
 
-def _parse_date(pub_date: str) -> str:
-    """Parse RFC 2822 date string to YYYY-MM-DD."""
-    if not pub_date:
-        return ""
-    try:
-        dt = parsedate_to_datetime(pub_date)
-        return dt.date().isoformat()
-    except Exception:
-        # Return raw string trimmed to 10 chars if it looks like a date
-        if re.match(r"\d{4}-\d{2}-\d{2}", pub_date):
-            return pub_date[:10]
-        return pub_date
+def _nv_website(session: requests.Session) -> list[dict]:
+    """Scrape the Novonesis careers listing page directly."""
+    jobs_url = f"{_NV_BASE}/en/careers/jobs"
+    for attempt in range(2):
+        if attempt > 0:
+            time.sleep(3 * attempt)
+        try:
+            resp = session.get(jobs_url, timeout=25)
+            if resp.status_code == 429:
+                logger.warning("Novonesis website: 429 rate-limited (attempt %d)", attempt + 1)
+                continue
+            if resp.status_code != 200:
+                logger.warning("Novonesis website: HTTP %d", resp.status_code)
+                return []
+            soup = BeautifulSoup(resp.text, "html.parser")
+            jobs = []
+            for a in soup.find_all("a", href=re.compile(r"/careers/jobs/")):
+                href = a["href"]
+                title = a.get_text(strip=True)
+                if not title or not re.search(r"[a-zA-Z]{3,}", title):
+                    continue
+                url = href if href.startswith("http") else _NV_BASE + href
+                jobs.append({
+                    "id": f"nv_web_{abs(hash(url)) % 10_000_000}",
+                    "title": title,
+                    "location": "Denmark",
+                    "date_posted": "",
+                    "url": url,
+                })
+            return jobs
+        except requests.RequestException as exc:
+            logger.debug("Novonesis website attempt %d: %s", attempt + 1, exc)
+    return []
