@@ -90,7 +90,7 @@ def _render_html(strong: list[dict], possible: list[dict]) -> str:
 
     <!-- Header -->
     <div style="background:#003e72; color:#fff; padding:28px 32px;">
-      <h1 style="margin:0; font-size:22px;">Job Alert — Novo Nordisk, Novonesis &amp; NNF</h1>
+      <h1 style="margin:0; font-size:22px;">Job Alert — Novo Nordisk, Novonesis, NNF, Genmab &amp; Lundbeck</h1>
       <p style="margin:6px 0 0; opacity:.8; font-size:14px;">{today}</p>
     </div>
 
@@ -103,10 +103,8 @@ def _render_html(strong: list[dict], possible: list[dict]) -> str:
       <p style="font-size:12px; color:#888; margin:0;">
         This alert was generated automatically.
         Jobs are sourced from
-        <a href="https://careers.novonordisk.com" style="color:#003e72;">careers.novonordisk.com</a>,
-        <a href="https://apply.workable.com/novonordiskfoundation/" style="color:#7a4b00;">novonordiskfonden.dk</a>
-        and
-        <a href="https://www.novonesis.com/en/careers/jobs" style="color:#1a6b1a;">novonesis.com</a>.
+        <a href="https://www.jobindex.dk" style="color:#003e72;">Jobindex.dk</a>
+        (Novo Nordisk, Novonesis, Novo Nordisk Fonden, Genmab, Lundbeck).
       </p>
     </div>
   </div>
@@ -151,9 +149,11 @@ def _html_card(job: dict) -> str:
     combined   = job.get("_combined", 0.0)
 
     _BADGES = {
-        "Novo Nordisk": ("#e8f0fb", "#003e72"),
-        "Novonesis":    ("#e8f4e8", "#1a6b1a"),
+        "Novo Nordisk":        ("#e8f0fb", "#003e72"),
+        "Novonesis":           ("#e8f4e8", "#1a6b1a"),
         "Novo Nordisk Fonden": ("#fdf3e3", "#7a4b00"),
+        "Genmab":              ("#fde8f0", "#8b0045"),
+        "Lundbeck":            ("#f0e8fd", "#4a008b"),
     }
     company_badge = ""
     if company in _BADGES:
