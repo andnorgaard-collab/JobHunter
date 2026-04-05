@@ -77,7 +77,7 @@ def save_seen_ids(seen_ids: set[str]) -> None:
 
 def run() -> int:
     """Execute one monitoring cycle. Returns exit code (0 = success)."""
-    logger.info("=== Novo Nordisk job monitor started ===")
+    logger.info("=== Job monitor started ===")
 
     # 1. Load state
     seen_ids = load_seen_ids()
@@ -87,23 +87,15 @@ def run() -> int:
     all_jobs = scraper.fetch_all_jobs()
     if not all_jobs:
         logger.warning("No jobs fetched – check scraper logs for errors.")
-        # Don't treat this as fatal; the site may be temporarily unavailable.
-        return 0
 
-    logger.info("Fetched %d total jobs from careers site.", len(all_jobs))
+    logger.info("Fetched %d total jobs.", len(all_jobs))
 
     # 3. Filter to only new (unseen) jobs
     new_jobs = [j for j in all_jobs if j["id"] not in seen_ids]
     logger.info("%d new jobs (not seen before).", len(new_jobs))
 
-    if not new_jobs:
-        logger.info("Nothing new – exiting without sending email.")
-        # Still update seen_ids with any IDs we haven't stored yet
-        _update_seen(seen_ids, all_jobs)
-        return 0
-
-    # 4. Match / classify
-    classified = matcher.classify_jobs(new_jobs)
+    # 4. Match / classify new jobs
+    classified = matcher.classify_jobs(new_jobs) if new_jobs else {"strong": [], "possible": []}
     strong = classified["strong"]
     possible = classified["possible"]
     logger.info(
@@ -111,16 +103,21 @@ def run() -> int:
         len(strong), len(possible), len(new_jobs),
     )
 
-    # 5. Send email (only if there's at least one match)
-    if strong or possible:
-        ok = notifier.send_alert(strong, possible)
-        if not ok:
-            logger.error("Email delivery failed.")
-            # Continue – we still want to persist state so we don't double-alert.
-    else:
-        logger.info("No keyword matches in new jobs – no email sent.")
+    # 5. Build stats for the daily summary section
+    from collections import Counter
+    by_company = Counter(j["company"] for j in all_jobs)
+    stats = {
+        "total_scraped": len(all_jobs),
+        "new_jobs": len(new_jobs),
+        "by_company": dict(by_company),
+    }
 
-    # 6. Persist state (mark ALL fetched jobs as seen, not just matches)
+    # 6. Always send the daily email
+    ok = notifier.send_alert(strong, possible, stats=stats)
+    if not ok:
+        logger.error("Email delivery failed.")
+
+    # 7. Persist state (mark ALL fetched jobs as seen, not just matches)
     _update_seen(seen_ids, all_jobs)
     return 0
 

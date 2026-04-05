@@ -33,26 +33,31 @@ logger = logging.getLogger(__name__)
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def send_alert(strong: list[dict], possible: list[dict]) -> bool:
+def send_alert(
+    strong: list[dict],
+    possible: list[dict],
+    stats: dict | None = None,
+) -> bool:
     """
-    Compose and send the job-alert email.
+    Compose and send the daily job-alert email.
 
-    Returns True if the email was sent successfully, False otherwise.
+    Always sends (even when there are no new matches) so the user gets
+    a daily digest with scraping stats. Returns True on success.
     Does NOT raise – caller decides whether to treat failure as fatal.
     """
-    total = len(strong) + len(possible)
-    if total == 0:
-        logger.info("No new matching jobs – skipping email.")
-        return True
-
     from_email = _require_env("ALERT_FROM_EMAIL")
     to_email = _require_env("ALERT_TO_EMAIL")
     if not from_email or not to_email:
         return False
 
-    subject = f"🔔 [{total}] new job{'s' if total != 1 else ''} match your profile"
-    html_body = _render_html(strong, possible)
-    text_body = _render_text(strong, possible)
+    total_matches = len(strong) + len(possible)
+    if total_matches:
+        subject = f"🔔 [{total_matches}] nye jobs matcher din profil"
+    else:
+        subject = "📋 Dagligt joboverblik – ingen nye matches i dag"
+
+    html_body = _render_html(strong, possible, stats or {})
+    text_body = _render_text(strong, possible, stats or {})
 
     # Pick backend
     sendgrid_key = os.environ.get("SENDGRID_API_KEY", "").strip()
@@ -66,21 +71,30 @@ def send_alert(strong: list[dict], possible: list[dict]) -> bool:
 # Email rendering
 # ---------------------------------------------------------------------------
 
-def _render_html(strong: list[dict], possible: list[dict]) -> str:
+def _render_html(strong: list[dict], possible: list[dict], stats: dict) -> str:
     today = date.today().strftime("%d %b %Y")
     sections = ""
 
     if strong:
-        sections += _html_section("⭐ Strong matches", strong, "#1a472a")
+        sections += _html_section("⭐ Stærke matches", strong, "#1a472a")
     if possible:
-        sections += _html_section("🔍 Possible matches", possible, "#2c5f8a")
+        sections += _html_section("🔍 Mulige matches", possible, "#2c5f8a")
+    if not strong and not possible:
+        sections += (
+            '<p style="color:#888; font-style:italic; margin:16px 0;">'
+            "Ingen nye jobs matchede din profil i dag."
+            "</p>"
+        )
+
+    summary_rows = _html_stats_table(stats)
+    total_matches = len(strong) + len(possible)
 
     return f"""<!DOCTYPE html>
-<html lang="en">
+<html lang="da">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Novo Nordisk Job Alert</title>
+  <title>Dagligt joboverblik</title>
 </head>
 <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
              background:#f5f5f5; margin:0; padding:24px;">
@@ -90,26 +104,81 @@ def _render_html(strong: list[dict], possible: list[dict]) -> str:
 
     <!-- Header -->
     <div style="background:#003e72; color:#fff; padding:28px 32px;">
-      <h1 style="margin:0; font-size:22px;">Job Alert — Novo Nordisk, Novonesis, NNF, Genmab &amp; Lundbeck</h1>
+      <h1 style="margin:0; font-size:22px;">Dagligt joboverblik</h1>
       <p style="margin:6px 0 0; opacity:.8; font-size:14px;">{today}</p>
     </div>
 
     <div style="padding:24px 32px;">
-      <p style="margin:0 0 20px; color:#444;">
-        {len(strong) + len(possible)} new job posting(s) match your criteria.
+
+      <!-- Daily stats summary -->
+      <h2 style="color:#003e72; font-size:15px; margin:0 0 12px;
+                 border-bottom:2px solid #003e72; padding-bottom:6px;">
+        📊 Dagens overblik
+      </h2>
+      {summary_rows}
+      <p style="margin:14px 0 24px; color:#444; font-size:14px;">
+        <strong>{total_matches}</strong> job matcher din profil i dag
+        ({len(strong)} stærke, {len(possible)} mulige).
       </p>
+
       {sections}
+
       <hr style="border:none; border-top:1px solid #eee; margin:24px 0;">
       <p style="font-size:12px; color:#888; margin:0;">
-        This alert was generated automatically.
-        Jobs are sourced from
+        Genereret automatisk fra
         <a href="https://www.jobindex.dk" style="color:#003e72;">Jobindex.dk</a>
-        (Novo Nordisk, Novonesis, Novo Nordisk Fonden, Genmab, Lundbeck).
+        (Novo Nordisk · Novonesis · Novo Nordisk Fonden · Genmab · Lundbeck).
       </p>
     </div>
   </div>
 </body>
 </html>"""
+
+
+def _html_stats_table(stats: dict) -> str:
+    """Render a compact per-company stats table."""
+    if not stats:
+        return ""
+
+    by_company = stats.get("by_company", {})
+    new_jobs = stats.get("new_jobs", 0)
+    total = stats.get("total_scraped", 0)
+
+    rows = ""
+    company_order = [
+        "Novo Nordisk", "Novonesis", "Novo Nordisk Fonden", "Genmab", "Lundbeck"
+    ]
+    _COLORS = {
+        "Novo Nordisk":        "#003e72",
+        "Novonesis":           "#1a6b1a",
+        "Novo Nordisk Fonden": "#7a4b00",
+        "Genmab":              "#8b0045",
+        "Lundbeck":            "#4a008b",
+    }
+    for company in company_order:
+        count = by_company.get(company, 0)
+        color = _COLORS.get(company, "#444")
+        rows += (
+            f'<tr>'
+            f'<td style="padding:5px 10px 5px 0; color:{color}; font-weight:600; '
+            f'font-size:13px;">{company}</td>'
+            f'<td style="padding:5px 0; font-size:13px; color:#333;">'
+            f'{count} stillinger fundet</td>'
+            f'</tr>'
+        )
+
+    return f"""
+    <table style="border-collapse:collapse; margin-bottom:8px; width:100%;">
+      {rows}
+      <tr style="border-top:1px solid #eee;">
+        <td style="padding:7px 10px 5px 0; font-size:13px; color:#555;">
+          <strong>I alt</strong>
+        </td>
+        <td style="padding:7px 0 5px; font-size:13px; color:#555;">
+          {total} stillinger · <strong>{new_jobs} nye</strong> siden sidst
+        </td>
+      </tr>
+    </table>"""
 
 
 def _html_section(heading: str, jobs: list[dict], accent_color: str) -> str:
@@ -193,24 +262,44 @@ def _html_card(job: dict) -> str:
     </div>"""
 
 
-def _render_text(strong: list[dict], possible: list[dict]) -> str:
+def _render_text(strong: list[dict], possible: list[dict], stats: dict) -> str:
+    today = date.today().strftime("%d %b %Y")
     lines = [
-        "Novo Nordisk Job Alert",
+        f"Dagligt joboverblik — {today}",
         "=" * 40,
+        "",
+        "DAGENS OVERBLIK",
+        "-" * 30,
+    ]
+
+    by_company = stats.get("by_company", {})
+    for company in ["Novo Nordisk", "Novonesis", "Novo Nordisk Fonden", "Genmab", "Lundbeck"]:
+        lines.append(f"  {company}: {by_company.get(company, 0)} stillinger")
+
+    total = stats.get("total_scraped", 0)
+    new_jobs = stats.get("new_jobs", 0)
+    total_matches = len(strong) + len(possible)
+    lines += [
+        f"  I alt: {total} stillinger · {new_jobs} nye siden sidst",
+        f"  Matcher din profil: {total_matches} ({len(strong)} stærke, {len(possible)} mulige)",
         "",
     ]
 
     if strong:
-        lines.append("STRONG MATCHES")
+        lines.append("STÆRKE MATCHES")
         lines.append("-" * 30)
         for job in strong:
             lines += _text_job(job)
 
     if possible:
-        lines.append("POSSIBLE MATCHES")
+        lines.append("MULIGE MATCHES")
         lines.append("-" * 30)
         for job in possible:
             lines += _text_job(job)
+
+    if not strong and not possible:
+        lines.append("Ingen nye jobs matchede din profil i dag.")
+        lines.append("")
 
     return "\n".join(lines)
 

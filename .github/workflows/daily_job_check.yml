@@ -1,10 +1,10 @@
-name: Daily Novo Nordisk Job Check
+name: Daily Job Alert
 
 on:
-  # Every day at 06:00 UTC = 07:00 CET (UTC+1) / 08:00 CEST (UTC+2 in summer).
-  # Adjust the hour if you want a different local time.
+  # 05:00 UTC = 07:00 CEST (UTC+2, summer) / 06:00 CET (UTC+1, winter).
+  # Denmark observes CEST from late March through late October.
   schedule:
-    - cron: "0 6 * * *"
+    - cron: "0 5 * * *"
 
   # Allow a manual run from the Actions tab at any time.
   # Set test_email to true to verify email delivery without scraping.
