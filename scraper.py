@@ -1,5 +1,10 @@
 """
-scraper.py — Fetches job listings from Jobindex for monitored companies.
+scraper.py — Fetches job listings from Jobindex RSS feeds.
+
+Jobindex provides server-rendered RSS feeds for company searches:
+  https://www.jobindex.dk/jobsoegning/rss?virksomhed=COMPANY_NAME
+
+This bypasses JavaScript rendering issues with the HTML search page.
 
 Companies monitored:
   - Novo Nordisk
@@ -7,22 +12,17 @@ Companies monitored:
   - Novo Nordisk Fonden
   - Genmab
   - Lundbeck
-
-Jobindex search URL:
-  https://www.jobindex.dk/jobsoegning?virksomhed=COMPANY_NAME
-
-Each job dict returned includes at minimum:
-  id, title, location, date_posted, url, company
 """
 
 import logging
 import re
 import time
 import urllib.parse
-from datetime import date, timedelta
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import requests
-from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
@@ -30,26 +30,20 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-JOBINDEX_BASE = "https://www.jobindex.dk"
-JOBINDEX_SEARCH = f"{JOBINDEX_BASE}/jobsoegning"
+JOBINDEX_RSS = "https://www.jobindex.dk/jobsoegning/rss"
 
-# Polite delay between company requests (seconds)
-REQUEST_DELAY = 2.0
-
-# Max pages to fetch per company (20 jobs/page → 200 jobs max)
-MAX_PAGES = 10
+REQUEST_DELAY = 2.0  # seconds between company requests
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,*/*",
+    "Accept": "application/rss+xml, application/xml, text/xml, */*",
     "Accept-Language": "da-DK,da;q=0.9,en;q=0.8",
-    "Referer": "https://www.jobindex.dk/",
 }
 
-# Companies to monitor: (display name, Jobindex search query)
+# (display name, virksomhed= query parameter)
 COMPANIES = [
     ("Novo Nordisk",        "Novo Nordisk"),
     ("Novonesis",           "Novonesis"),
@@ -64,9 +58,7 @@ COMPANIES = [
 # ---------------------------------------------------------------------------
 
 def fetch_all_jobs() -> list[dict]:
-    """
-    Return job dicts from all monitored companies via Jobindex.
-    """
+    """Return job dicts from all monitored companies via Jobindex RSS."""
     session = requests.Session()
     session.headers.update(HEADERS)
 
@@ -74,18 +66,18 @@ def fetch_all_jobs() -> list[dict]:
 
     for company_name, query in COMPANIES:
         jobs = _fetch_company(session, company_name, query)
-        logger.info("%s: %d jobs fetched from Jobindex", company_name, len(jobs))
+        logger.info("%s: %d jobs fetched", company_name, len(jobs))
         all_jobs.extend(jobs)
         time.sleep(REQUEST_DELAY)
 
     if not all_jobs:
-        logger.warning("All Jobindex scrapers returned 0 jobs.")
+        logger.warning("All RSS feeds returned 0 jobs.")
 
     return all_jobs
 
 
 # ---------------------------------------------------------------------------
-# Per-company fetcher
+# Per-company RSS fetcher
 # ---------------------------------------------------------------------------
 
 def _fetch_company(
@@ -93,196 +85,127 @@ def _fetch_company(
     company_name: str,
     query: str,
 ) -> list[dict]:
-    """Fetch all Jobindex listings for one company, handling pagination."""
+    """Fetch all Jobindex RSS items for one company."""
+    params = {"virksomhed": query}
+    url = f"{JOBINDEX_RSS}?{urllib.parse.urlencode(params)}"
+
+    try:
+        resp = session.get(url, timeout=30)
+    except requests.RequestException as exc:
+        logger.warning("%s: request error: %s", company_name, exc)
+        return []
+
+    if resp.status_code != 200:
+        logger.warning("%s: HTTP %d from RSS feed", company_name, resp.status_code)
+        return []
+
+    logger.debug("%s: RSS feed → %d bytes", company_name, len(resp.content))
+    return _parse_rss(resp.content, company_name)
+
+
+# ---------------------------------------------------------------------------
+# RSS parsing
+# ---------------------------------------------------------------------------
+
+def _parse_rss(content: bytes, company_name: str) -> list[dict]:
+    """Parse an RSS feed and return job dicts."""
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError as exc:
+        logger.warning("%s: RSS parse error: %s", company_name, exc)
+        return []
+
+    # RSS namespace handling — strip any namespace prefix
+    def _tag(el: ET.Element, name: str) -> str | None:
+        child = el.find(name)
+        if child is None:
+            # Try with common RSS namespaces
+            for ns in ("", "{http://purl.org/rss/1.0/}", "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}"):
+                child = el.find(f"{ns}{name}")
+                if child is not None:
+                    break
+        return child.text.strip() if child is not None and child.text else None
+
     jobs: list[dict] = []
-    page = 0
-    seen_ids: set[str] = set()
+    channel = root.find("channel") or root
+    items = channel.findall("item")
 
-    while page < MAX_PAGES:
-        params: dict = {"virksomhed": query}
-        if page > 0:
-            params["tstart"] = page * 20  # Jobindex uses tstart=0,20,40,...
+    logger.debug("%s: %d <item> elements in RSS", company_name, len(items))
 
-        url = f"{JOBINDEX_SEARCH}?{urllib.parse.urlencode(params)}"
-        try:
-            resp = session.get(url, timeout=30)
-        except requests.RequestException as exc:
-            logger.warning("%s: request error on page %d: %s", company_name, page, exc)
-            break
+    for item in items:
+        title     = _tag(item, "title") or ""
+        link      = _tag(item, "link") or ""
+        desc      = _tag(item, "description") or ""
+        pub_date  = _tag(item, "pubDate") or ""
+        guid      = _tag(item, "guid") or link
 
-        if resp.status_code != 200:
-            logger.warning(
-                "%s: HTTP %d on page %d", company_name, resp.status_code, page
-            )
-            break
+        if not title or not link:
+            continue
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-        page_jobs = _parse_jobindex_page(soup, company_name)
+        # Build a stable job ID from the Jobindex job ID in the URL
+        job_id = _extract_id(link, guid)
 
-        if not page_jobs:
-            logger.debug("%s: no jobs on page %d – stopping", company_name, page)
-            break
+        # Parse location from description (Jobindex puts it in the RSS desc)
+        location = _extract_location_from_desc(desc)
 
-        # Dedup within the run (Jobindex sometimes repeats listings)
-        new_on_page = 0
-        for job in page_jobs:
-            if job["id"] not in seen_ids:
-                seen_ids.add(job["id"])
-                jobs.append(job)
-                new_on_page += 1
+        # Parse date
+        date_posted = _parse_date(pub_date)
 
-        logger.debug("%s: page %d → %d new jobs", company_name, page, new_on_page)
-
-        # Stop if the page had no genuinely new jobs
-        if new_on_page == 0:
-            break
-
-        # Check if there's a next page
-        if not _has_next_page(soup, page):
-            break
-
-        page += 1
-        time.sleep(0.5)
+        jobs.append({
+            "id":          job_id,
+            "title":       title,
+            "location":    location,
+            "date_posted": date_posted,
+            "url":         link,
+            "company":     company_name,
+        })
 
     return jobs
 
 
-# ---------------------------------------------------------------------------
-# HTML parsing
-# ---------------------------------------------------------------------------
-
-def _parse_jobindex_page(soup: BeautifulSoup, company_name: str) -> list[dict]:
-    """Extract job dicts from a Jobindex search results page."""
-    jobs: list[dict] = []
-
-    # Jobindex uses <article> tags with class "jix_robotjob" or similar,
-    # or <li> with class "PaidJob" / "OrganicJob".
-    # Try multiple selectors for robustness.
-    candidates = (
-        soup.find_all("article", class_=re.compile(r"jix_robotjob", re.I))
-        or soup.find_all("li", class_=re.compile(r"(PaidJob|OrganicJob)", re.I))
-        or soup.find_all("div", class_=re.compile(r"jobsearch-result", re.I))
-    )
-
-    if not candidates:
-        # Fallback: any element with a link to /jobannonce/
-        candidates = [
-            a.find_parent(["article", "li", "div"])
-            for a in soup.find_all("a", href=re.compile(r"/jobannonce/\d+", re.I))
-            if a.find_parent(["article", "li", "div"])
-        ]
-        # Deduplicate parent elements
-        seen_parents: list = []
-        unique: list = []
-        for c in candidates:
-            if c not in seen_parents:
-                seen_parents.append(c)
-                unique.append(c)
-        candidates = unique
-
-    for item in candidates:
-        job = _extract_job(item, company_name)
-        if job:
-            jobs.append(job)
-
-    return jobs
-
-
-def _extract_job(item: BeautifulSoup, company_name: str) -> dict | None:
-    """Extract a single job dict from a result element."""
-    # --- Title and URL ---
-    link = item.find("a", href=re.compile(r"/jobannonce/\d+", re.I))
-    if not link:
-        return None
-
-    href = link.get("href", "")
-    title = link.get_text(strip=True)
-
-    # Build absolute URL
-    if href.startswith("http"):
-        job_url = href
-    else:
-        job_url = JOBINDEX_BASE + href
-
-    # Extract Jobindex job ID from URL like /jobannonce/1234567/...
-    id_match = re.search(r"/jobannonce/(\d+)", href)
-    if not id_match:
-        return None
-    job_id = f"ji_{id_match.group(1)}"
-
-    if not title:
-        return None
-
-    # --- Location ---
-    location = _extract_location(item)
-
-    # --- Date posted ---
-    date_posted = _extract_date(item)
-
-    return {
-        "id": job_id,
-        "title": title,
-        "location": location,
-        "date_posted": date_posted,
-        "url": job_url,
-        "company": company_name,
-    }
-
-
-def _extract_location(item: BeautifulSoup) -> str:
-    """Best-effort location extraction from a job result element."""
-    # Try <span> or <p> elements containing typical Danish location patterns
-    for tag in item.find_all(["span", "p", "div"]):
-        text = tag.get_text(strip=True)
-        # Look for patterns like "København", "Bagsværd", "Søborg", etc.
-        if re.search(
-            r"(køben|bagsv|søborg|gladsax|hillerød|lynge|måløv|gentofte|"
-            r"lyngby|allerød|ballerup|frederiks|helsin|odense|aarhus|"
-            r"[A-ZÆØÅ][a-zæøå]{2,},?\s*(Denmark|Danmark))",
-            text,
-            re.IGNORECASE,
-        ) and len(text) < 60:
-            return text
-    return ""
-
-
-def _extract_date(item: BeautifulSoup) -> str:
-    """Best-effort date extraction from a job result element."""
-    # Try <time> element with datetime attribute
-    time_tag = item.find("time")
-    if time_tag:
-        dt = time_tag.get("datetime", "") or time_tag.get_text(strip=True)
-        if dt:
-            return dt[:10]  # Return YYYY-MM-DD portion
-
-    # Try text patterns like "I dag", "I går", "3 dage siden", or a date string
-    for tag in item.find_all(["span", "p", "div", "small"]):
-        text = tag.get_text(strip=True)
-        if re.match(r"\d{1,2}/\d{1,2}[-/]\d{2,4}", text):
-            return text
-        if re.match(r"\d{4}-\d{2}-\d{2}", text):
-            return text[:10]
-        if re.search(r"\bi dag\b", text, re.IGNORECASE):
-            return date.today().isoformat()
-        if re.search(r"\bi går\b", text, re.IGNORECASE):
-            return (date.today() - timedelta(days=1)).isoformat()
-        m = re.search(r"(\d+)\s+dag", text, re.IGNORECASE)
+def _extract_id(link: str, guid: str) -> str:
+    """Extract a stable ID from a Jobindex job URL."""
+    # Jobindex URLs: https://www.jobindex.dk/jobannonce/1234567/title
+    for text in (link, guid):
+        m = re.search(r"/jobannonce/(\d+)", text)
         if m:
-            return (date.today() - timedelta(days=int(m.group(1)))).isoformat()
+            return f"ji_{m.group(1)}"
+    # Fallback: hash the URL
+    return f"ji_{abs(hash(link)) % 10_000_000}"
+
+
+def _extract_location_from_desc(desc: str) -> str:
+    """
+    Jobindex RSS descriptions look like:
+      '<b>Virksomhed:</b> Novo Nordisk<br><b>Sted:</b> Bagsværd<br>...'
+    Extract the 'Sted:' field.
+    """
+    # Strip HTML tags
+    plain = re.sub(r"<[^>]+>", " ", desc)
+    plain = re.sub(r"\s+", " ", plain).strip()
+
+    # Try "Sted: <location>" pattern
+    m = re.search(r"Sted\s*:\s*([^|;,\n]+)", plain, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    # Try "Location: <location>" pattern (English RSS)
+    m = re.search(r"Location\s*:\s*([^|;,\n]+)", plain, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
 
     return ""
 
 
-def _has_next_page(soup: BeautifulSoup, current_page: int) -> bool:
-    """Return True if a 'next page' link exists on the results page."""
-    # Look for pagination links containing the next tstart value
-    next_tstart = (current_page + 1) * 20
-    # Jobindex next-page link typically has tstart=N in href
-    next_link = soup.find(
-        "a", href=re.compile(rf"tstart={next_tstart}(&|$)", re.I)
-    )
-    if next_link:
-        return True
-    # Fallback: look for a "næste" or ">" navigation link
-    nav = soup.find("a", string=re.compile(r"næste|next|»|›|>", re.IGNORECASE))
-    return bool(nav)
+def _parse_date(pub_date: str) -> str:
+    """Parse RFC 2822 date string to YYYY-MM-DD."""
+    if not pub_date:
+        return ""
+    try:
+        dt = parsedate_to_datetime(pub_date)
+        return dt.date().isoformat()
+    except Exception:
+        # Return raw string trimmed to 10 chars if it looks like a date
+        if re.match(r"\d{4}-\d{2}-\d{2}", pub_date):
+            return pub_date[:10]
+        return pub_date
